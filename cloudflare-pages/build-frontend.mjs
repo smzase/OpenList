@@ -77,8 +77,17 @@ async function downloadAndExtract(url) {
   await rm(tmpTar, { force: true });
   await writeFile(
     resolve(distDir, "_routes.json"),
-    JSON.stringify({ version: 1, include: ["/*"], exclude: [] }, null, 2) + "\n",
+    JSON.stringify(
+      {
+        version: 1,
+        include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
+        exclude: [],
+      },
+      null,
+      2,
+    ) + "\n",
   );
+  await writeFile(resolve(distDir, "_redirects"), "/* /index.html 200\n");
   console.log("OpenList frontend has been written to cloudflare-pages/dist");
   return true;
 }
