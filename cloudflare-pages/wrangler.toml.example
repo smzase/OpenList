@@ -1,0 +1,13 @@
+name = "openlist-pages"
+pages_build_output_dir = "dist"
+
+[[d1_databases]]
+binding = "OPENLIST_DB"
+database_name = "openlist-pages"
+database_id = "replace-with-your-d1-database-id"
+
+[vars]
+OPENLIST_ADMIN_USERNAME = "admin"
+OPENLIST_ADMIN_PASSWORD = "change-me"
+OPENLIST_JWT_SECRET = "change-me-to-a-long-random-string"
+OPENLIST_WEB_CDN = ""
