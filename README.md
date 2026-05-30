@@ -89,7 +89,12 @@ cloudflare-pages/
 
 默认不需要配置 `OPENLIST_WEB_CDN`。构建命令会从 `OpenListTeam/OpenList-Frontend` 下载官方前端并内置到 Pages 部署产物中。
 
-如果 GitHub API 频率限制导致下载失败，可以在 Pages 环境变量中添加 `GITHUB_TOKEN`，或设置 `OPENLIST_FRONTEND_VERSION` 指定前端 release tag。
+构建脚本会优先使用 GitHub release 直链下载 `openlist-frontend-dist.tar.gz`，通常不会触发 GitHub API 限流。如果直链下载失败才会回退到 GitHub API。
+
+如果仍然遇到 GitHub API 频率限制，可以在 Pages 环境变量中添加 `GITHUB_TOKEN`。也可以设置：
+
+- `OPENLIST_FRONTEND_VERSION`：指定前端 release tag，例如 `v1.2.3`
+- `OPENLIST_FRONTEND_ASSET`：指定 release 资源文件名，默认 `openlist-frontend-dist.tar.gz`
 
 ## OneDrive 存储配置
 

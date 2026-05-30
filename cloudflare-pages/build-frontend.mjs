@@ -10,6 +10,9 @@ const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
 
 const repo = process.env.OPENLIST_FRONTEND_REPO || "OpenListTeam/OpenList-Frontend";
 const version = process.env.OPENLIST_FRONTEND_VERSION || "latest";
+const assetName = process.env.OPENLIST_FRONTEND_ASSET || "openlist-frontend-dist.tar.gz";
+const releasePath = version === "latest" ? "latest/download" : `download/${version}`;
+const directUrl = `https://github.com/${repo}/releases/${releasePath}/${assetName}`;
 const apiUrl =
   version === "latest"
     ? `https://api.github.com/repos/${repo}/releases/latest`
@@ -24,10 +27,19 @@ if (process.env.GITHUB_TOKEN) {
 }
 
 async function main() {
-  console.log(`Fetching OpenList frontend release metadata: ${apiUrl}`);
+  console.log(`Downloading OpenList frontend directly: ${directUrl}`);
+  if (await downloadAndExtract(directUrl)) {
+    return;
+  }
+
+  console.log(`Direct download failed. Fetching OpenList frontend release metadata: ${apiUrl}`);
   const releaseResp = await fetch(apiUrl, { headers });
   if (!releaseResp.ok) {
-    throw new Error(`Failed to fetch frontend release metadata: ${releaseResp.status} ${releaseResp.statusText}`);
+    throw new Error(
+      `Failed to fetch frontend release metadata: ${releaseResp.status} ${releaseResp.statusText}. ` +
+        "If this is a GitHub API rate limit, set a Pages environment variable named GITHUB_TOKEN, " +
+        "or set OPENLIST_FRONTEND_VERSION and OPENLIST_FRONTEND_ASSET to use a direct release asset.",
+    );
   }
   const release = await releaseResp.json();
   const asset = (release.assets || []).find((item) => {
@@ -39,9 +51,16 @@ async function main() {
   }
 
   console.log(`Downloading frontend asset: ${asset.name}`);
-  const assetResp = await fetch(asset.browser_download_url, { headers: { "User-Agent": headers["User-Agent"] } });
+  if (!(await downloadAndExtract(asset.browser_download_url))) {
+    throw new Error(`Failed to download frontend asset: ${asset.browser_download_url}`);
+  }
+}
+
+async function downloadAndExtract(url) {
+  const assetResp = await fetch(url, { headers: { "User-Agent": headers["User-Agent"] }, redirect: "follow" });
   if (!assetResp.ok || !assetResp.body) {
-    throw new Error(`Failed to download frontend asset: ${assetResp.status} ${assetResp.statusText}`);
+    console.log(`Download failed: ${assetResp.status} ${assetResp.statusText}`);
+    return false;
   }
 
   await rm(tmpTar, { force: true });
@@ -61,6 +80,7 @@ async function main() {
     JSON.stringify({ version: 1, include: ["/*"], exclude: [] }, null, 2) + "\n",
   );
   console.log("OpenList frontend has been written to cloudflare-pages/dist");
+  return true;
 }
 
 async function streamToFile(stream, path) {
