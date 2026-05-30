@@ -185,6 +185,8 @@ async function apiRouter(request, env, path) {
   if (path === "/api/fs/get") return fsGet(request, env);
   if (path === "/api/fs/dirs") return fsDirs(request, env);
   if (path === "/api/fs/search") return fsSearch(request, env);
+  if (path.startsWith("/api/task/")) return requireLogin(request, env, (user) => taskCompat(request, env, path, user));
+  if (path.startsWith("/api/share/")) return requireLogin(request, env, (user) => shareCompat(request, env, path, user));
   if (path === "/api/admin/driver/list") return requireAdmin(request, env, () => ok({ Onedrive: ONEDRIVE_DRIVER_INFO }));
   if (path === "/api/admin/driver/names") return requireAdmin(request, env, () => ok(["Onedrive"]));
   if (path === "/api/admin/driver/info") return requireAdmin(request, env, async () => {
@@ -198,6 +200,9 @@ async function apiRouter(request, env, path) {
   if (path.startsWith("/api/admin/storage/")) return requireAdmin(request, env, () => adminStorage(request, env, path));
   if (path.startsWith("/api/admin/meta/")) return requireAdmin(request, env, () => adminMeta(request, env, path));
   if (path.startsWith("/api/admin/index/")) return requireAdmin(request, env, () => adminIndex(request, env, path));
+  if (path.startsWith("/api/admin/scan/")) return requireAdmin(request, env, () => adminScan(request, env, path));
+  if (path.startsWith("/api/admin/message/")) return requireAdmin(request, env, () => adminMessage(request, env, path));
+  if (path.startsWith("/api/admin/")) return requireAdmin(request, env, () => adminCompat(path));
   return apiError("api not found", 404);
 }
 
@@ -307,6 +312,11 @@ async function updateCurrentUser(request, env, user) {
 
 async function adminUser(request, env, path, admin) {
   const db = env.OPENLIST_DB;
+  if (path.includes("/sshkey/")) {
+    if (path.endsWith("/list")) return ok({ content: [], total: 0 });
+    if (path.endsWith("/delete")) return ok();
+    return apiError("SSH keys are not supported in Cloudflare Pages mode", 400);
+  }
   if (path.endsWith("/list")) {
     const page = pageReq(await readBody(request), request);
     const total = await db.prepare("SELECT COUNT(*) AS count FROM users").first();
@@ -410,6 +420,12 @@ async function adminSetting(request, env, path) {
     }
     return ok();
   }
+  if (path.endsWith("/delete")) {
+    const key = new URL(request.url).searchParams.get("key");
+    if (!key) return apiError("key is required", 400);
+    await db.prepare("DELETE FROM settings WHERE key = ?").bind(key).run();
+    return ok();
+  }
   if (path.endsWith("/default")) {
     const url = new URL(request.url);
     const groups = (url.searchParams.get("groups") || url.searchParams.get("group") || "")
@@ -426,6 +442,9 @@ async function adminSetting(request, env, path) {
     const token = await randomToken(24);
     await setSetting(env, "token", token);
     return ok(token);
+  }
+  if (path.includes("/set_")) {
+    return ok("Cloudflare Pages mode does not support offline download tool settings");
   }
   return apiError("api not found", 404);
 }
@@ -517,15 +536,22 @@ async function adminMeta(request, env, path) {
 async function adminIndex(request, env, path) {
   if (path.endsWith("/progress")) {
     const value = await getSetting(env, "index_progress", "{}");
-    return ok(parseJson(value, {}));
+    const progress = parseJson(value, {});
+    return ok({
+      is_done: progress.is_done ?? progress.status !== "running",
+      obj_count: progress.obj_count ?? progress.indexed ?? 0,
+      last_done_time: progress.last_done_time || progress.updated_at || "",
+      error: progress.error || "",
+      ...progress,
+    });
   }
   if (path.endsWith("/clear")) {
     await env.OPENLIST_DB.prepare("DELETE FROM search_nodes").run();
-    await setSetting(env, "index_progress", JSON.stringify({ status: "cleared", indexed: 0, updated_at: new Date().toISOString() }));
+    await setSetting(env, "index_progress", JSON.stringify({ status: "cleared", is_done: true, indexed: 0, obj_count: 0, updated_at: new Date().toISOString() }));
     return ok();
   }
   if (path.endsWith("/stop")) {
-    await setSetting(env, "index_progress", JSON.stringify({ status: "stopped", updated_at: new Date().toISOString() }));
+    await setSetting(env, "index_progress", JSON.stringify({ status: "stopped", is_done: true, updated_at: new Date().toISOString() }));
     return ok();
   }
   if (path.endsWith("/build") || path.endsWith("/update")) {
@@ -533,6 +559,53 @@ async function adminIndex(request, env, path) {
     return ok(result);
   }
   return apiError("api not found", 404);
+}
+
+async function adminScan(request, env, path) {
+  if (path.endsWith("/progress")) {
+    const value = await getSetting(env, "scan_progress", "");
+    return ok(parseJson(value, { is_done: true, obj_count: 0, updated_at: new Date().toISOString() }));
+  }
+  if (path.endsWith("/start")) {
+    await setSetting(env, "scan_progress", JSON.stringify({ is_done: true, obj_count: 0, updated_at: new Date().toISOString() }));
+    return ok();
+  }
+  if (path.endsWith("/stop")) {
+    await setSetting(env, "scan_progress", JSON.stringify({ is_done: true, obj_count: 0, updated_at: new Date().toISOString() }));
+    return ok();
+  }
+  return apiError("api not found", 404);
+}
+
+async function adminMessage(request, env, path) {
+  if (path.endsWith("/get")) {
+    return ok({ type: "string", content: "Cloudflare Pages mode: no Microsoft OAuth messenger messages." });
+  }
+  if (path.endsWith("/send")) return ok();
+  return apiError("api not found", 404);
+}
+
+async function taskCompat(request, env, path, user) {
+  const parts = path.split("/").filter(Boolean);
+  const action = parts[3] || "";
+  if (action === "undone" || action === "done") return ok([]);
+  if (["retry_some", "cancel_some", "delete_some", "retry_failed"].includes(action)) return ok({});
+  return ok();
+}
+
+async function shareCompat(request, env, path, user) {
+  if (path.endsWith("/list")) return ok({ content: [], total: 0 });
+  if (path.endsWith("/get")) return apiError("Share is not supported in Cloudflare Pages mode", 404);
+  if (path.endsWith("/create") || path.endsWith("/update")) return ok({ id: String((await readBody(request)).id || "") });
+  if (path.endsWith("/delete") || path.endsWith("/enable") || path.endsWith("/disable")) return ok();
+  return apiError("Share is not supported in Cloudflare Pages mode", 404);
+}
+
+function adminCompat(path) {
+  if (path.endsWith("/list")) return ok({ content: [], total: 0 });
+  if (path.endsWith("/progress")) return ok({ is_done: true, obj_count: 0 });
+  if (path.endsWith("/get")) return ok({});
+  return ok();
 }
 
 async function fsList(request, env) {
@@ -813,7 +886,7 @@ async function graphJson(accessToken, url) {
 }
 
 async function buildIndex(env) {
-  await setSetting(env, "index_progress", JSON.stringify({ status: "running", indexed: 0, updated_at: new Date().toISOString() }));
+  await setSetting(env, "index_progress", JSON.stringify({ status: "running", is_done: false, indexed: 0, obj_count: 0, updated_at: new Date().toISOString() }));
   await env.OPENLIST_DB.prepare("DELETE FROM search_nodes").run();
   const rows = await env.OPENLIST_DB.prepare("SELECT * FROM storages WHERE disabled = 0 AND disable_index = 0 ORDER BY storage_order, mount_path").all();
   let indexed = 0;
@@ -838,7 +911,9 @@ async function buildIndex(env) {
       }
       await setSetting(env, "index_progress", JSON.stringify({
         status: indexed >= maxNodes ? "partial" : "running",
+        is_done: indexed >= maxNodes,
         indexed,
+        obj_count: indexed,
         current: cur.path,
         updated_at: new Date().toISOString(),
       }));
@@ -846,8 +921,11 @@ async function buildIndex(env) {
   }
   const progress = {
     status: indexed >= maxNodes ? "partial" : "done",
+    is_done: true,
     indexed,
+    obj_count: indexed,
     limit: maxNodes,
+    last_done_time: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
   await setSetting(env, "index_progress", JSON.stringify(progress));
