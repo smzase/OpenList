@@ -99,7 +99,7 @@ const ONEDRIVE_DRIVER_INFO = {
     driverItem("mount_path", "string", "", "", true, "The path you want to mount to, it is unique and cannot be repeated"),
     driverItem("order", "number", "", "", false, "use to sort"),
     driverItem("remark", "text"),
-    driverItem("cache_expiration", "number", "30", "", true, "The cache expiration time for this storage"),
+    driverItem("cache_expiration", "number", "30", "", true, "The cache expiration time for this storage, in minutes"),
     driverItem("custom_cache_policies", "text"),
     driverItem("web_proxy", "bool"),
     driverItem("webdav_policy", "select", "302_redirect", "302_redirect,use_proxy_url,native_proxy", true),
@@ -492,6 +492,7 @@ async function adminStorage(request, env, path) {
     await db.prepare("DELETE FROM storages WHERE id = ?").bind(id).run();
     await db.prepare("DELETE FROM onedrive_tokens WHERE storage_id = ?").bind(id).run();
     await db.prepare("DELETE FROM search_nodes WHERE storage_id = ?").bind(id).run();
+    await clearCachePrefix(env, "fs:");
     return ok();
   }
   if (path.endsWith("/enable") || path.endsWith("/disable")) {
@@ -646,8 +647,9 @@ async function fsList(request, env) {
   const sorted = sortObjects(filtered, listing.storage);
   const page = pageReq(body, request);
   const sliced = sorted.slice(page.offset, page.offset + page.per_page);
+  const settings = await settingsMap(env);
   return ok({
-    content: await Promise.all(sliced.map((obj) => objResp(env, obj, reqPath, listing.storage))),
+    content: await Promise.all(sliced.map((obj) => objResp(env, obj, reqPath, listing.storage, settings))),
     total: sorted.length,
     readme: metaText(meta, reqPath, "readme", "r_sub"),
     header: metaText(meta, reqPath, "header", "header_sub"),
@@ -678,13 +680,14 @@ async function fsGet(request, env) {
   const relatedList = found.obj.is_dir ? [] : (await listPath(env, parent).catch(() => ({ content: [] }))).content
     .filter((obj) => !obj.is_dir && obj.name !== found.obj.name && obj.name.startsWith(found.obj.name.replace(/\.[^.]+$/, "")))
     .slice(0, 20);
+  const settings = await settingsMap(env);
   return ok({
-    ...(await objResp(env, found.obj, parent, found.storage)),
+    ...(await objResp(env, found.obj, parent, found.storage, settings)),
     raw_url: rawUrl,
     readme: metaText(meta, reqPath, "readme", "r_sub"),
     header: metaText(meta, reqPath, "header", "header_sub"),
     provider: "Onedrive",
-    related: await Promise.all(relatedList.map((obj) => objResp(env, obj, parent, found.storage))),
+    related: await Promise.all(relatedList.map((obj) => objResp(env, obj, parent, found.storage, settings))),
   });
 }
 
@@ -722,6 +725,7 @@ async function fsSearch(request, env) {
     .bind(like, `${parent === "/" ? "" : parent}%`, page.per_page, page.offset)
     .all();
   const content = [];
+  const settings = await settingsMap(env);
   for (const row of rows.results) {
     const full = joinPath(row.parent, row.name);
     const meta = await nearestMeta(env, full);
@@ -732,7 +736,7 @@ async function fsSearch(request, env) {
         is_dir: !!row.is_dir,
         size: row.size,
         modified: row.modified,
-        type: objType(row.name, !!row.is_dir),
+        type: objType(row.name, !!row.is_dir, settings),
       });
     }
   }
@@ -741,20 +745,24 @@ async function fsSearch(request, env) {
 
 async function downloadRouter(request, env, path) {
   const reqPath = normalizePath(decodeURIComponent(path.slice(2)) || "/");
-  const found = await getObjAtPath(env, reqPath);
-  if (!found.obj || found.obj.is_dir) return text("not found", 404);
+  const storage = await matchedStorage(env, reqPath);
+  if (!storage || samePath(storage.mount_path, reqPath)) return text("not found", 404);
   const url = new URL(request.url);
   const sign = url.searchParams.get("sign") || "";
   const signTs = Number(url.searchParams.get("sign_ts") || url.searchParams.get("openlist_ts") || "0");
-  const mustSign = boolSetting(await getSetting(env, "sign_all", "true")) || truthy(found.storage.enable_sign);
+  const mustSign = boolSetting(await getSetting(env, "sign_all", "true")) || truthy(storage.enable_sign);
   if (mustSign) {
     const verified = await verifyDownloadSign(env, reqPath, sign, signTs);
     if (!verified.ok) return text("invalid sign", 403);
-    const expiration = Number(await getSetting(env, "link_expiration", "0"));
+    const expiration = linkExpirationSeconds(await getSetting(env, "link_expiration", "0"));
     if (expiration > 0 && (!verified.ts || nowSeconds() - verified.ts > expiration)) return text("link expired", 403);
   }
-  const downloadUrl = await oneDriveDownloadUrl(env, found.storage, reqPath);
-  return Response.redirect(downloadUrl, 302);
+  try {
+    const downloadUrl = await oneDriveDownloadUrl(env, storage, reqPath);
+    return Response.redirect(downloadUrl, 302);
+  } catch (error) {
+    return text(error && error.message ? error.message : "not found", 404);
+  }
 }
 
 async function listPath(env, reqPath) {
@@ -769,7 +777,8 @@ async function listPath(env, reqPath) {
   if (cached) return { content: cached, storage };
   const items = await oneDriveList(env, storage, reqPath);
   const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
-  if (Number(storage.cache_expiration) > 0) await setCache(env, cacheKey, content, Number(storage.cache_expiration));
+  const cacheSeconds = cacheSecondsForPath(storage, reqPath);
+  if (cacheSeconds > 0) await setCache(env, cacheKey, content, cacheSeconds);
   return { content, storage };
 }
 
@@ -812,7 +821,16 @@ async function getObjAtPath(env, reqPath) {
       obj: { name: basename(reqPath) || "", size: 0, is_dir: true, modified: storage.modified, created: storage.modified },
     };
   }
+  const cached = await cachedObjFromParentList(env, storage, reqPath);
+  if (cached) return { storage, obj: cached };
   return { storage, obj: await oneDriveGet(env, storage, reqPath) };
+}
+
+async function cachedObjFromParentList(env, storage, reqPath) {
+  const parent = dirname(reqPath);
+  const cached = await getCache(env, `fs:list:${storage.id}:${parent}`);
+  if (!Array.isArray(cached)) return null;
+  return cached.find((obj) => obj && obj.name === basename(reqPath)) || null;
 }
 
 async function matchedStorage(env, reqPath) {
@@ -826,11 +844,11 @@ async function matchedStorage(env, reqPath) {
 
 async function oneDriveList(env, storage, reqPath) {
   const api = await oneDriveApi(env, storage);
-  const url = `${api.childrenUrl(reqPath)}?$top=200`;
+  const url = `${api.childrenUrl(reqPath)}?$top=1000`;
   return oneDrivePagedList(api.accessToken, url).catch(async (error) => {
     if (error.graphCode !== "InvalidAuthenticationToken") throw error;
     const freshApi = await oneDriveApi(env, storage, true);
-    return oneDrivePagedList(freshApi.accessToken, `${freshApi.childrenUrl(reqPath)}?$top=200`);
+    return oneDrivePagedList(freshApi.accessToken, `${freshApi.childrenUrl(reqPath)}?$top=1000`);
   });
 }
 
@@ -841,18 +859,35 @@ async function oneDriveGet(env, storage, reqPath) {
     const freshApi = await oneDriveApi(env, storage, true);
     return graphJson(freshApi.accessToken, freshApi.itemUrl(reqPath));
   });
-  return oneDriveObj(data);
+  return oneDriveObj(data, true);
 }
 
 async function oneDriveDownloadUrl(env, storage, reqPath) {
+  const cacheKey = `fs:download:${storage.id}:${reqPath}`;
+  const cached = await getCache(env, cacheKey);
+  if (cached) return typeof cached === "string" ? cached : cached.url;
+
+  const cachedObj = await cachedObjFromParentList(env, storage, reqPath);
+  if (cachedObj && cachedObj.download_url) {
+    const downloadUrl = applyCustomDownloadHost(cachedObj.download_url, storage);
+    await cacheDownloadUrl(env, storage, reqPath, downloadUrl);
+    return downloadUrl;
+  }
+
   const api = await oneDriveApi(env, storage);
   const data = await graphJson(api.accessToken, api.itemUrl(reqPath)).catch(async (error) => {
     if (error.graphCode !== "InvalidAuthenticationToken") throw error;
     const freshApi = await oneDriveApi(env, storage, true);
     return graphJson(freshApi.accessToken, freshApi.itemUrl(reqPath));
   });
-  let downloadUrl = data["@microsoft.graph.downloadUrl"];
+  let downloadUrl = data["@microsoft.graph.downloadUrl"] || data.content?.downloadUrl || "";
   if (!downloadUrl) throw new Error("OneDrive download URL not found");
+  downloadUrl = applyCustomDownloadHost(downloadUrl, storage);
+  await cacheDownloadUrl(env, storage, reqPath, downloadUrl);
+  return downloadUrl;
+}
+
+function applyCustomDownloadHost(downloadUrl, storage) {
   const addition = parseJson(storage.addition);
   if (addition.custom_host) {
     const original = new URL(downloadUrl);
@@ -862,6 +897,11 @@ async function oneDriveDownloadUrl(env, storage, reqPath) {
     downloadUrl = original.toString();
   }
   return downloadUrl;
+}
+
+async function cacheDownloadUrl(env, storage, reqPath, downloadUrl) {
+  const seconds = Math.min(cacheSecondsForPath(storage, dirname(reqPath)), 3300);
+  if (seconds > 0) await setCache(env, `fs:download:${storage.id}:${reqPath}`, downloadUrl, seconds);
 }
 
 async function oneDrivePagedList(accessToken, url) {
@@ -1123,7 +1163,7 @@ ${settings.customize_head || ""}
     <label><span>Refresh token</span><input id="st-refresh"></label>
     <label><span>SharePoint site_id (optional)</span><input id="st-site"></label>
     <label><span>Custom download host (optional)</span><input id="st-host"></label>
-    <label><span>Cache seconds</span><input id="st-cache" type="number" value="30"></label>
+    <label><span>Cache minutes</span><input id="st-cache" type="number" value="30"></label>
     <label><span>Order by</span><select id="st-order-by"><option value="">Default</option><option>name</option><option>size</option><option>modified</option></select></label>
     <label><span>Direction</span><select id="st-order-dir"><option value="">Default</option><option>asc</option><option>desc</option></select></label>
   </div>
@@ -1340,11 +1380,21 @@ function isStaticAssetRequest(path) {
 }
 
 async function publicSettings(env) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM settings WHERE flag != ? OR key IN ('customize_head', 'customize_body') ORDER BY item_index")
-    .bind(FLAG_PRIVATE)
-    .all();
+  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM settings ORDER BY item_index").all();
+  const exposedPrivate = new Set([
+    "customize_head",
+    "customize_body",
+    "text_types",
+    "audio_types",
+    "video_types",
+    "image_types",
+    "proxy_types",
+    "proxy_ignore_headers",
+  ]);
   const data = {};
-  for (const row of rows.results) data[row.key] = row.value;
+  for (const row of rows.results) {
+    if (row.flag !== FLAG_PRIVATE || exposedPrivate.has(row.key)) data[row.key] = row.value;
+  }
   return ok(data);
 }
 
@@ -1374,7 +1424,7 @@ async function signedDownloadUrl(env, reqPath, storage) {
   return `/d${encodeDownloadPath(reqPath)}?sign=${encodeURIComponent(sign)}&sign_ts=${ts}&openlist_ts=${ts}`;
 }
 
-async function objResp(env, obj, parent, storage) {
+async function objResp(env, obj, parent, storage, settings = {}) {
   const reqPath = joinPath(parent, obj.name);
   const ts = nowSeconds();
   const sign = obj.is_dir ? "" : await downloadSign(env, reqPath, ts);
@@ -1386,16 +1436,16 @@ async function objResp(env, obj, parent, storage) {
     created: obj.created || obj.modified || new Date().toISOString(),
     sign,
     thumb: obj.thumb || "",
-    type: objType(obj.name, !!obj.is_dir),
+    type: objType(obj.name, !!obj.is_dir, settings),
     hashinfo: "",
     hash_info: {},
     raw_url: obj.is_dir ? "" : `/d${encodeDownloadPath(reqPath)}?sign=${encodeURIComponent(sign)}&sign_ts=${ts}&openlist_ts=${ts}`,
   };
 }
 
-function oneDriveObj(item) {
+function oneDriveObj(item, includeDownloadUrl = false) {
   const info = item.fileSystemInfo || {};
-  return {
+  const obj = {
     id: item.id || "",
     name: item.name || "",
     size: Number(item.size || 0),
@@ -1404,6 +1454,8 @@ function oneDriveObj(item) {
     created: info.createdDateTime || item.createdDateTime || "",
     thumb: item.thumbnails && item.thumbnails[0] && item.thumbnails[0].medium ? item.thumbnails[0].medium.url : "",
   };
+  if (includeDownloadUrl) obj.download_url = item["@microsoft.graph.downloadUrl"] || item.content?.downloadUrl || "";
+  return obj;
 }
 
 function oneDrivePath(storage, addition, reqPath) {
@@ -1871,14 +1923,67 @@ function boolSetting(value) {
   return truthy(value);
 }
 
-function objType(name, isDir) {
+function linkExpirationSeconds(value) {
+  const hours = Number(value || 0);
+  return hours > 0 ? Math.floor(hours * 3600) : 0;
+}
+
+function cacheSecondsForPath(storage, reqPath) {
+  let minutes = Number(storage?.cache_expiration ?? 30);
+  const policies = String(storage?.custom_cache_policies || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const relative = storage ? stripPrefix(reqPath, storage.mount_path) : normalizePath(reqPath);
+  for (const line of policies) {
+    const index = line.lastIndexOf(":");
+    if (index <= 0) continue;
+    const pattern = line.slice(0, index).trim();
+    const policyMinutes = Number(line.slice(index + 1).trim());
+    if (!Number.isFinite(policyMinutes)) continue;
+    if (globMatch(pattern, relative) || globMatch(pattern, reqPath)) {
+      minutes = policyMinutes;
+      break;
+    }
+  }
+  return minutes > 0 ? Math.floor(minutes * 60) : 0;
+}
+
+function globMatch(pattern, path) {
+  pattern = normalizePath(pattern || "/");
+  path = normalizePath(path || "/");
+  let source = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*") {
+      if (pattern[i + 1] === "*") {
+        source += ".*";
+        i++;
+      } else {
+        source += "[^/]*";
+      }
+    } else if (c === "?") {
+      source += "[^/]";
+    } else {
+      source += c.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${source}$`).test(path);
+}
+
+function objType(name, isDir, settings = {}) {
   if (isDir) return 1;
   const ext = String(name).split(".").pop().toLowerCase();
-  if (["mp4", "mkv", "avi", "mov", "webm", "flv", "m3u8"].includes(ext)) return 2;
-  if (["mp3", "flac", "ogg", "m4a", "wav", "opus", "wma"].includes(ext)) return 3;
-  if (["txt", "md", "json", "js", "ts", "go", "sh", "yml", "html", "css"].includes(ext)) return 4;
-  if (["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "avif"].includes(ext)) return 5;
+  if (settingExts(settings, "video_types").includes(ext)) return 2;
+  if (settingExts(settings, "audio_types").includes(ext)) return 3;
+  if (settingExts(settings, "text_types").includes(ext)) return 4;
+  if (settingExts(settings, "image_types").includes(ext)) return 5;
   return 0;
+}
+
+function settingExts(settings, key) {
+  const fallback = (DEFAULT_SETTINGS.find((s) => s.key === key) || {}).value || "";
+  return String(settings[key] ?? fallback)
+    .split(/[\s,]+/)
+    .map((ext) => ext.trim().replace(/^\./, "").toLowerCase())
+    .filter(Boolean);
 }
 
 function timingSafeEqual(a, b) {

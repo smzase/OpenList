@@ -131,7 +131,7 @@ cloudflare-pages/
 通过设置项 `link_expiration` 控制下载链接有效期。
 
 - `0`：不过期。
-- 大于 `0`：单位为秒，超时后 `/d/*` 下载链接会失效。
+- 大于 `0`：单位为小时，和原 OpenList 行为一致；超时后 `/d/*` 下载链接会失效。
 
 下载时 Pages Functions 会向 Microsoft Graph 获取 OneDrive 的临时下载链接，然后返回 `302 Location`，不会代理文件内容。
 
