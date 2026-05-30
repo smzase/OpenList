@@ -1340,7 +1340,9 @@ function isStaticAssetRequest(path) {
 }
 
 async function publicSettings(env) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM settings WHERE flag != ? ORDER BY item_index").bind(FLAG_PRIVATE).all();
+  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM settings WHERE flag != ? OR key IN ('customize_head', 'customize_body') ORDER BY item_index")
+    .bind(FLAG_PRIVATE)
+    .all();
   const data = {};
   for (const row of rows.results) data[row.key] = row.value;
   return ok(data);
