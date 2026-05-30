@@ -115,7 +115,7 @@ const ONEDRIVE_DRIVER_INFO = {
     driverItem("root_folder_path", "string", "/", "", true),
     driverItem("region", "select", "global", "global,cn,us,de", true),
     driverItem("is_sharepoint", "bool"),
-    driverItem("use_online_api", "bool", "false"),
+    driverItem("use_online_api", "bool", "true"),
     driverItem("api_url_address", "string", "https://api.oplist.org/onedrive/renewapi"),
     driverItem("client_id", "string"),
     driverItem("client_secret", "string"),
@@ -636,7 +636,12 @@ async function fsList(request, env) {
   const password = String(body.password || "");
   const meta = await nearestMeta(env, reqPath);
   if (!(await canAccess(user, meta, reqPath, password))) return apiError("password is incorrect or you have no permission", 403);
-  const listing = await listPath(env, reqPath);
+  let listing;
+  try {
+    listing = await listPath(env, reqPath);
+  } catch (error) {
+    return apiError(`Failed to list ${reqPath}: ${error && error.message ? error.message : String(error)}`, 500);
+  }
   const filtered = applyMetaHide(listing.content, meta, reqPath);
   const sorted = sortObjects(filtered, listing.storage);
   const page = pageReq(body, request);
@@ -661,7 +666,12 @@ async function fsGet(request, env) {
   const password = String(body.password || "");
   const meta = await nearestMeta(env, reqPath);
   if (!(await canAccess(user, meta, reqPath, password))) return apiError("password is incorrect or you have no permission", 403);
-  const found = await getObjAtPath(env, reqPath);
+  let found;
+  try {
+    found = await getObjAtPath(env, reqPath);
+  } catch (error) {
+    return apiError(`Failed to get ${reqPath}: ${error && error.message ? error.message : String(error)}`, 500);
+  }
   if (!found.obj) return apiError("object not found", 404);
   const parent = dirname(reqPath);
   const rawUrl = found.obj.is_dir ? "" : await signedDownloadUrl(env, reqPath, found.storage);
@@ -816,25 +826,30 @@ async function matchedStorage(env, reqPath) {
 async function oneDriveList(env, storage, reqPath) {
   const api = await oneDriveApi(env, storage);
   const url = `${api.childrenUrl(reqPath)}?$top=200`;
-  const values = [];
-  let next = url;
-  while (next) {
-    const data = await graphJson(api.accessToken, next);
-    values.push(...(data.value || []).map((item) => oneDriveObj(item)));
-    next = data["@odata.nextLink"] || "";
-  }
-  return values;
+  return oneDrivePagedList(api.accessToken, url).catch(async (error) => {
+    if (error.graphCode !== "InvalidAuthenticationToken") throw error;
+    const freshApi = await oneDriveApi(env, storage, true);
+    return oneDrivePagedList(freshApi.accessToken, `${freshApi.childrenUrl(reqPath)}?$top=200`);
+  });
 }
 
 async function oneDriveGet(env, storage, reqPath) {
   const api = await oneDriveApi(env, storage);
-  const data = await graphJson(api.accessToken, api.itemUrl(reqPath));
+  const data = await graphJson(api.accessToken, api.itemUrl(reqPath)).catch(async (error) => {
+    if (error.graphCode !== "InvalidAuthenticationToken") throw error;
+    const freshApi = await oneDriveApi(env, storage, true);
+    return graphJson(freshApi.accessToken, freshApi.itemUrl(reqPath));
+  });
   return oneDriveObj(data);
 }
 
 async function oneDriveDownloadUrl(env, storage, reqPath) {
   const api = await oneDriveApi(env, storage);
-  const data = await graphJson(api.accessToken, api.itemUrl(reqPath));
+  const data = await graphJson(api.accessToken, api.itemUrl(reqPath)).catch(async (error) => {
+    if (error.graphCode !== "InvalidAuthenticationToken") throw error;
+    const freshApi = await oneDriveApi(env, storage, true);
+    return graphJson(freshApi.accessToken, freshApi.itemUrl(reqPath));
+  });
   let downloadUrl = data["@microsoft.graph.downloadUrl"];
   if (!downloadUrl) throw new Error("OneDrive download URL not found");
   const addition = parseJson(storage.addition);
@@ -848,9 +863,20 @@ async function oneDriveDownloadUrl(env, storage, reqPath) {
   return downloadUrl;
 }
 
-async function oneDriveApi(env, storage) {
+async function oneDrivePagedList(accessToken, url) {
+  const values = [];
+  let next = url;
+  while (next) {
+    const data = await graphJson(accessToken, next);
+    values.push(...(data.value || []).map((item) => oneDriveObj(item)));
+    next = data["@odata.nextLink"] || "";
+  }
+  return values;
+}
+
+async function oneDriveApi(env, storage, forceRefresh = false) {
   const addition = parseJson(storage.addition);
-  const token = await getOneDriveAccessToken(env, storage, addition);
+  const token = await getOneDriveAccessToken(env, storage, addition, forceRefresh);
   const graphBase = graphBaseUrl(addition.region);
   const driveBase = addition.site_id
     ? `${graphBase}/sites/${encodeURIComponent(addition.site_id)}/drive`
@@ -870,13 +896,21 @@ async function oneDriveApi(env, storage) {
   };
 }
 
-async function getOneDriveAccessToken(env, storage, addition) {
+async function getOneDriveAccessToken(env, storage, addition, forceRefresh = false) {
   const row = await env.OPENLIST_DB.prepare("SELECT * FROM onedrive_tokens WHERE storage_id = ?").bind(storage.id).first();
-  if (row && row.access_token && Number(row.expires_at) > nowSeconds() + 120) return row.access_token;
+  if (!forceRefresh && row && row.access_token && Number(row.expires_at) > nowSeconds() + 120) return row.access_token;
   const refreshToken = (row && row.refresh_token) || addition.refresh_token;
   if (!refreshToken) throw new Error("OneDrive refresh_token is required");
   const clientId = addition.client_id || env.ONEDRIVE_CLIENT_ID;
   const clientSecret = addition.client_secret || env.ONEDRIVE_CLIENT_SECRET;
+  const shouldUseOnlineApi = truthy(addition.use_online_api ?? true) || (!clientId || !clientSecret);
+  if (shouldUseOnlineApi && addition.api_url_address) {
+    const data = await refreshOneDriveWithOnlineApi(addition.api_url_address, refreshToken);
+    await env.OPENLIST_DB.prepare("INSERT INTO onedrive_tokens (storage_id, access_token, refresh_token, expires_at, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(storage_id) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token, expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP")
+      .bind(storage.id, data.access_token, data.refresh_token || refreshToken, nowSeconds() + Number(data.expires_in || 3600))
+      .run();
+    return data.access_token;
+  }
   if (!clientId || !clientSecret) throw new Error("OneDrive client_id and client_secret are required");
   const tenant = addition.tenant || "common";
   const tokenUrl = oauthBaseUrl(addition.region, tenant);
@@ -895,12 +929,30 @@ async function getOneDriveAccessToken(env, storage, addition) {
   return data.access_token;
 }
 
+async function refreshOneDriveWithOnlineApi(apiAddress, refreshToken) {
+  const url = new URL(apiAddress);
+  url.searchParams.set("refresh_ui", refreshToken);
+  url.searchParams.set("server_use", "true");
+  url.searchParams.set("driver_txt", "onedrive_pr");
+  const resp = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+  const textBody = await resp.text();
+  const data = parseJson(textBody, {});
+  if (!resp.ok) throw new Error(data.text || data.error_description || data.error || textBody || "failed to refresh OneDrive token with online API");
+  if (!data.access_token || !data.refresh_token) {
+    throw new Error(data.text || "empty token returned from OneDrive online API, please check refresh_token");
+  }
+  return data;
+}
+
 async function graphJson(accessToken, url) {
   const resp = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
+    const graphCode = data.error && data.error.code;
     const message = data.error && (data.error.message || data.error.code);
-    throw new Error(message || `Microsoft Graph request failed: ${resp.status}`);
+    const error = new Error(message || `Microsoft Graph request failed: ${resp.status}`);
+    error.graphCode = graphCode || "";
+    throw error;
   }
   return data;
 }
@@ -1358,11 +1410,15 @@ function oneDrivePath(storage, addition, reqPath) {
 
 function graphBaseUrl(region) {
   if (region === "cn") return "https://microsoftgraph.chinacloudapi.cn/v1.0";
+  if (region === "us") return "https://graph.microsoft.us/v1.0";
+  if (region === "de") return "https://graph.microsoft.de/v1.0";
   return "https://graph.microsoft.com/v1.0";
 }
 
 function oauthBaseUrl(region, tenant) {
   if (region === "cn") return `https://login.partner.microsoftonline.cn/${tenant}/oauth2/v2.0/token`;
+  if (region === "us") return `https://login.microsoftonline.us/${tenant}/oauth2/v2.0/token`;
+  if (region === "de") return `https://login.microsoftonline.de/${tenant}/oauth2/v2.0/token`;
   return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
 }
 

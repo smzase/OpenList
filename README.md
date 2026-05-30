@@ -99,8 +99,10 @@ cloudflare-pages/
 - `mount_path`：挂载路径，例如 `/drive`
 - `root_folder_path`：OneDrive 根目录路径，例如 `/`
 - `region`：区域，通常使用 `global`
-- `client_id`：Microsoft 应用 Client ID
-- `client_secret`：Microsoft 应用 Client Secret
+- `use_online_api`：默认开启，使用 OpenList 在线 API 刷新 token
+- `api_url_address`：在线 API 地址，默认 `https://api.oplist.org/onedrive/renewapi`
+- `client_id`：Microsoft 应用 Client ID；关闭 `use_online_api` 时才需要
+- `client_secret`：Microsoft 应用 Client Secret；关闭 `use_online_api` 时才需要
 - `redirect_uri`：OAuth 回调地址
 - `refresh_token`：OneDrive refresh token
 - `site_id`：SharePoint 站点 ID，可选
