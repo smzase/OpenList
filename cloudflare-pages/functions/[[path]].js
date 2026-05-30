@@ -175,6 +175,12 @@ async function apiRouter(request, env, path) {
   if (path === "/api/auth/login" || path === "/api/auth/login/hash") return login(request, env, path.endsWith("/hash"));
   if (path === "/api/auth/logout") return logout(request, env);
   if (path === "/api/me") return currentUser(request, env);
+  if (path === "/api/me/update") return requireLogin(request, env, (user) => updateCurrentUser(request, env, user));
+  if (path === "/api/auth/2fa/generate") return apiError("2FA is not supported in Cloudflare Pages mode", 400);
+  if (path === "/api/auth/2fa/verify") return apiError("2FA is not supported in Cloudflare Pages mode", 400);
+  if (path === "/api/me/sshkey/list") return requireLogin(request, env, () => ok([]));
+  if (path === "/api/me/sshkey/add") return requireLogin(request, env, () => apiError("SSH keys are not supported in Cloudflare Pages mode", 400));
+  if (path === "/api/me/sshkey/delete") return requireLogin(request, env, () => ok());
   if (path === "/api/fs/list") return fsList(request, env);
   if (path === "/api/fs/get") return fsGet(request, env);
   if (path === "/api/fs/dirs") return fsDirs(request, env);
@@ -275,6 +281,28 @@ async function requireAdmin(request, env, handler) {
   const user = await getRequestUser(request, env, true);
   if (!user || user.role !== ROLE_ADMIN || user.disabled) return apiError("permission denied", 403);
   return handler(user);
+}
+
+async function requireLogin(request, env, handler) {
+  const user = await getRequestUser(request, env, false);
+  if (!user || user.role === ROLE_GUEST) return apiError("login required", 401);
+  return handler(user);
+}
+
+async function updateCurrentUser(request, env, user) {
+  const body = await readBody(request);
+  let salt = user.salt;
+  let pwdHash = user.pwd_hash;
+  let pwdTs = user.pwd_ts;
+  if (body.password) {
+    salt = await randomToken(16);
+    pwdHash = await passwordHashFromRaw(String(body.password), salt);
+    pwdTs = nowSeconds();
+  }
+  await env.OPENLIST_DB.prepare("UPDATE users SET username = ?, pwd_hash = ?, pwd_ts = ?, salt = ?, sso_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(String(body.username || user.username), pwdHash, pwdTs, salt, String(body.sso_id || user.sso_id || ""), user.id)
+    .run();
+  return ok();
 }
 
 async function adminUser(request, env, path, admin) {
@@ -1432,9 +1460,12 @@ function safeUser(user) {
     password: "",
     base_path: user.base_path,
     role: user.role,
+    is_admin: user.role === ROLE_ADMIN,
+    is_guest: user.role === ROLE_GUEST,
     disabled: !!user.disabled,
     permission: user.permission,
     otp: !!user.otp_secret,
+    otp_secret: "",
     sso_id: user.sso_id || "",
     allow_ldap: !!user.allow_ldap,
   };
@@ -1547,7 +1578,9 @@ function intParam(request, key) {
 
 function bearerToken(request) {
   const auth = request.headers.get("authorization") || "";
-  return auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  if (!auth) return "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  return auth.trim();
 }
 
 function item(key, value, type, group, flag = FLAG_PUBLIC, options = "", help = "") {
