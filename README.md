@@ -58,7 +58,7 @@ cloudflare-pages/
 4. 连接当前 Git 仓库。
 5. 设置 Pages 构建参数：
    - Root directory：`cloudflare-pages`
-   - Build command：`node build-frontend.mjs`
+   - Build command：留空
    - Build output directory：`dist`
 6. 在 Cloudflare 控制台创建一个 D1 数据库。
 7. 在 Pages 项目中绑定 D1 数据库，绑定名必须为：
@@ -68,7 +68,7 @@ cloudflare-pages/
    - `OPENLIST_ADMIN_USERNAME`：初始管理员用户名，例如 `admin`
    - `OPENLIST_ADMIN_PASSWORD`：初始管理员密码
    - `OPENLIST_JWT_SECRET`：用于签名下载链接的长随机字符串
-   - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；通常可以留空，因为构建时会内置官方前端
+   - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；通常可以留空，因为官方前端已经内置在 `dist` 中
 10. 部署 Pages 项目。
 
 如果构建日志出现 `Output directory "cloudflare-pages/dist" not found`，通常是下面两种原因之一：
@@ -87,14 +87,9 @@ cloudflare-pages/
 5. 根据需要配置元信息、直链有效期、自定义头部和自定义内容。
 6. 如需搜索，进入索引管理构建 D1 轻量索引。
 
-默认不需要配置 `OPENLIST_WEB_CDN`。构建命令会从 `OpenListTeam/OpenList-Frontend` 下载官方前端并内置到 Pages 部署产物中。
+默认不需要配置 `OPENLIST_WEB_CDN`。官方前端已经直接放在 `cloudflare-pages/dist` 中，Cloudflare Pages 部署时不需要联网下载前端。
 
-构建脚本会优先使用 GitHub release 直链下载 `openlist-frontend-dist.tar.gz`，通常不会触发 GitHub API 限流。如果直链下载失败才会回退到 GitHub API。
-
-如果仍然遇到 GitHub API 频率限制，可以在 Pages 环境变量中添加 `GITHUB_TOKEN`。也可以设置：
-
-- `OPENLIST_FRONTEND_VERSION`：指定前端 release tag，例如 `v1.2.3`
-- `OPENLIST_FRONTEND_ASSET`：指定 release 资源文件名，默认 `openlist-frontend-dist.tar.gz`
+`cloudflare-pages/build-frontend.mjs` 只用于以后手动更新官方前端版本，部署时可以不用执行。
 
 ## OneDrive 存储配置
 

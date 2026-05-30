@@ -22,6 +22,7 @@ output/
 # vendor/
 /bin/*
 *.json
+!/cloudflare-pages/dist/**
 !/cloudflare-pages/dist/_routes.json
 /build
 /data/
