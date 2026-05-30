@@ -9,7 +9,7 @@
 - 支持 OneDrive / SharePoint 挂载。
 - 支持公开访问，未登录用户使用内置 `guest` 用户。
 - 支持设置 `guest` 的 `base_path`，限制公开用户只能访问指定目录。
-- 支持内置管理前端和管理员登录。
+- 支持内置官方 OpenList 前端和管理员登录。
 - 支持用户、设置、存储、元信息、轻量索引管理接口。
 - 支持自定义站点标题、Logo、favicon、主色、头部内容和页面内容。
 - 支持元信息：README、Header、密码、隐藏规则、读写用户字段。
@@ -27,6 +27,7 @@
 - 不支持 S3 服务端模式。
 - 不支持 Bleve、Meilisearch 等完整搜索引擎。
 - 当前只实现 OneDrive 驱动，其他网盘需要后续单独适配。
+- 官方前端中可能仍会显示上传、离线下载等入口；这些入口在 Pages 版后端不会生效。
 
 ## 目录说明
 
@@ -41,7 +42,7 @@ cloudflare-pages/
   wrangler.toml.example
 ```
 
-- `dist/index.html`：Cloudflare Pages 静态入口。实际页面由 Pages Functions 提供内置管理前端。
+- `dist/index.html`：Cloudflare Pages 静态入口。部署时会下载官方 OpenList 前端并写入这里。
 - `dist/_routes.json`：让所有路径都进入 Pages Functions。
 - `functions/[[path]].js`：Pages Functions 后端逻辑。
 - `schema.sql`：D1 数据库表结构。
@@ -57,7 +58,7 @@ cloudflare-pages/
 4. 连接当前 Git 仓库。
 5. 设置 Pages 构建参数：
    - Root directory：`cloudflare-pages`
-   - Build command：留空
+   - Build command：`node build-frontend.mjs`
    - Build output directory：`dist`
 6. 在 Cloudflare 控制台创建一个 D1 数据库。
 7. 在 Pages 项目中绑定 D1 数据库，绑定名必须为：
@@ -67,7 +68,7 @@ cloudflare-pages/
    - `OPENLIST_ADMIN_USERNAME`：初始管理员用户名，例如 `admin`
    - `OPENLIST_ADMIN_PASSWORD`：初始管理员密码
    - `OPENLIST_JWT_SECRET`：用于签名下载链接的长随机字符串
-   - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；留空则使用内置管理前端
+   - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；通常可以留空，因为构建时会内置官方前端
 10. 部署 Pages 项目。
 
 如果构建日志出现 `Output directory "cloudflare-pages/dist" not found`，通常是下面两种原因之一：
@@ -86,7 +87,9 @@ cloudflare-pages/
 5. 根据需要配置元信息、直链有效期、自定义头部和自定义内容。
 6. 如需搜索，进入索引管理构建 D1 轻量索引。
 
-默认不需要配置 `OPENLIST_WEB_CDN`。留空时会使用项目内置前端，可以完成文件浏览、登录、添加 OneDrive 存储、修改 guest 路径、配置设置、配置元信息和构建索引。
+默认不需要配置 `OPENLIST_WEB_CDN`。构建命令会从 `OpenListTeam/OpenList-Frontend` 下载官方前端并内置到 Pages 部署产物中。
+
+如果 GitHub API 频率限制导致下载失败，可以在 Pages 环境变量中添加 `GITHUB_TOKEN`，或设置 `OPENLIST_FRONTEND_VERSION` 指定前端 release tag。
 
 ## OneDrive 存储配置
 

@@ -151,6 +151,10 @@ export async function onRequest(context) {
     const url = new URL(request.url);
     const path = normalizePath(url.pathname);
 
+    if (isStaticAssetRequest(path) && env.ASSETS) {
+      const assetResp = await env.ASSETS.fetch(request);
+      if (assetResp.status !== 404) return assetResp;
+    }
     if (path === "/ping") return text("pong");
     if (path === "/manifest.json") return manifest(env, request);
     if (path.startsWith("/api/")) return apiRouter(request, env, path);
@@ -832,6 +836,16 @@ async function frontend(request, env) {
       return htmlResponse(injectHtml(html, settings, cdn));
     }
   }
+  if (env.ASSETS) {
+    const assetUrl = new URL(request.url);
+    assetUrl.pathname = "/index.html";
+    assetUrl.search = "";
+    const resp = await env.ASSETS.fetch(new Request(assetUrl.toString(), request));
+    if (resp.ok) {
+      const html = await resp.text();
+      return htmlResponse(injectHtml(html, settings, ""));
+    }
+  }
   const title = settings.site_title || "OpenList";
   return htmlResponse(builtinFrontendHtml(settings, title));
 }
@@ -1132,6 +1146,18 @@ function injectHtml(html, settings, cdn) {
   out = out.replace("</head>", `${settings.customize_head || ""}</head>`);
   out = out.replace("</body>", `${settings.customize_body || ""}</body>`);
   return out;
+}
+
+function isStaticAssetRequest(path) {
+  if (
+    path.startsWith("/assets/") ||
+    path.startsWith("/images/") ||
+    path.startsWith("/static/") ||
+    path.startsWith("/streamer/")
+  ) {
+    return true;
+  }
+  return /\.(?:js|mjs|css|map|png|jpg|jpeg|gif|svg|ico|webp|avif|woff2?|ttf|wasm|json|txt)$/i.test(path);
 }
 
 async function publicSettings(env) {
