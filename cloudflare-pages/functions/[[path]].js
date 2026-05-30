@@ -833,7 +833,11 @@ async function frontend(request, env) {
     }
   }
   const title = settings.site_title || "OpenList";
-  const fallback = `<!doctype html>
+  return htmlResponse(builtinFrontendHtml(settings, title));
+}
+
+function builtinFrontendHtml(settings, title) {
+  return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -841,58 +845,278 @@ async function frontend(request, env) {
 <title>${escapeHtml(title)}</title>
 <link rel="icon" href="${escapeAttr(settings.favicon || "https://res.oplist.org/logo/logo.svg")}">
 <style>
-:root{color-scheme:light dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
-body{margin:0;background:#f7f8fa;color:#1f2937}
-main{width:min(980px,calc(100vw - 32px));margin:40px auto}
-.bar{display:flex;align-items:center;gap:12px;margin-bottom:20px}
-.logo{width:36px;height:36px}
-.card{border:1px solid #d8dee8;border-radius:8px;background:#fff;padding:18px;margin:12px 0}
-a{color:${escapeCss(settings.main_color || "#1890ff")}}
+:root{color-scheme:light dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--main:${escapeCss(settings.main_color || "#1890ff")}}
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fb;color:#172033}
+a{color:var(--main)}
+button,input,textarea,select{font:inherit}
 button{border:1px solid #cbd5e1;background:#fff;border-radius:6px;padding:8px 10px;cursor:pointer}
-input{border:1px solid #cbd5e1;border-radius:6px;padding:8px;width:min(420px,100%)}
-@media(prefers-color-scheme:dark){body{background:#111827;color:#e5e7eb}.card{background:#18212f;border-color:#334155}button,input{background:#111827;color:#e5e7eb;border-color:#334155}}
+button.primary{background:var(--main);border-color:var(--main);color:#fff}
+input,textarea,select{border:1px solid #cbd5e1;border-radius:6px;padding:8px;width:100%;background:#fff;color:inherit}
+textarea{min-height:84px;resize:vertical}
+main{width:min(1180px,calc(100vw - 28px));margin:24px auto 44px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.logo{width:38px;height:38px;object-fit:contain}
+.brand h1{font-size:22px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+.tabs button.active{background:#172033;color:#fff;border-color:#172033}
+.card{border:1px solid #d8dee8;border-radius:8px;background:#fff;padding:16px;margin:12px 0}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row>*{width:auto}
+.muted{color:#64748b}
+.table{width:100%;border-collapse:collapse;margin-top:10px}
+.table th,.table td{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top}
+.table th{font-weight:600;color:#475569}
+.hidden{display:none!important}
+.msg{min-height:22px;color:#b45309;margin:8px 0}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+label{display:grid;gap:5px;font-size:13px;color:#475569}
+label span{font-weight:600}
+@media(max-width:760px){.grid,.grid.three{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}.row>*{width:100%}}
+@media(prefers-color-scheme:dark){body{background:#101827;color:#e5e7eb}.card,input,textarea,select,button{background:#182235;border-color:#334155}.tabs button.active{background:#e5e7eb;color:#111827;border-color:#e5e7eb}.table th,.table td{border-color:#334155}.muted,label{color:#94a3b8}}
 </style>
 ${settings.customize_head || ""}
 </head>
 <body>
 <main>
-<div class="bar"><img class="logo" src="${escapeAttr((settings.logo || "").split("\\n")[0] || "https://res.oplist.org/logo/logo.svg")}" alt=""><h1>${escapeHtml(title)}</h1></div>
-<div class="card">${markdownish(settings.announcement || "")}</div>
-<div class="card">
-<h2>Files</h2>
-<p><input id="path" value="/" aria-label="path"> <button id="go">Open</button></p>
-<div id="files">Loading...</div>
+<div class="top">
+  <div class="brand"><img class="logo" src="${escapeAttr((settings.logo || "").split("\\n")[0] || "https://res.oplist.org/logo/logo.svg")}" alt=""><h1>${escapeHtml(title)}</h1></div>
+  <div class="row"><span id="who" class="muted"></span><button id="logout" class="hidden">Logout</button></div>
 </div>
+<div class="card">${markdownish(settings.announcement || "")}</div>
+<div class="tabs">
+  <button data-tab="files" class="active">Files</button>
+  <button data-tab="login">Login</button>
+  <button data-tab="storages">Storages</button>
+  <button data-tab="users">Users</button>
+  <button data-tab="settings">Settings</button>
+  <button data-tab="metas">Metadata</button>
+  <button data-tab="index">Index</button>
+</div>
+<div id="msg" class="msg"></div>
+
+<section id="tab-files" class="card">
+  <h2>Files</h2>
+  <div class="row"><input id="path" value="/" aria-label="path"><button id="go" class="primary">Open</button><button id="up">Up</button></div>
+  <div id="readme" class="muted"></div>
+  <div id="files">Loading...</div>
+</section>
+
+<section id="tab-login" class="card hidden">
+  <h2>Admin Login</h2>
+  <div class="grid">
+    <label><span>Username</span><input id="login-user" autocomplete="username"></label>
+    <label><span>Password</span><input id="login-pass" type="password" autocomplete="current-password"></label>
+  </div>
+  <p><button id="login-btn" class="primary">Login</button></p>
+</section>
+
+<section id="tab-storages" class="card hidden">
+  <h2>OneDrive Storages</h2>
+  <div class="row"><button id="storage-new">New</button><button id="storage-load">Refresh</button></div>
+  <div id="storage-list"></div>
+  <h3 id="storage-form-title">Create Storage</h3>
+  <input id="storage-id" type="hidden">
+  <div class="grid three">
+    <label><span>Mount path</span><input id="st-mount" value="/drive"></label>
+    <label><span>Root folder path</span><input id="st-root" value="/"></label>
+    <label><span>Region</span><select id="st-region"><option>global</option><option>cn</option><option>us</option><option>de</option></select></label>
+    <label><span>Client ID</span><input id="st-client-id"></label>
+    <label><span>Client Secret</span><input id="st-client-secret" type="password"></label>
+    <label><span>Redirect URI</span><input id="st-redirect" value="https://api.oplist.org/onedrive/callback"></label>
+    <label><span>Refresh token</span><input id="st-refresh"></label>
+    <label><span>SharePoint site_id (optional)</span><input id="st-site"></label>
+    <label><span>Custom download host (optional)</span><input id="st-host"></label>
+    <label><span>Cache seconds</span><input id="st-cache" type="number" value="30"></label>
+    <label><span>Order by</span><select id="st-order-by"><option value="">Default</option><option>name</option><option>size</option><option>modified</option></select></label>
+    <label><span>Direction</span><select id="st-order-dir"><option value="">Default</option><option>asc</option><option>desc</option></select></label>
+  </div>
+  <p class="row"><label><span><input id="st-disabled" type="checkbox"> Disabled</span></label><label><span><input id="st-sign" type="checkbox"> Enable sign</span></label></p>
+  <p><button id="storage-save" class="primary">Save Storage</button></p>
+</section>
+
+<section id="tab-users" class="card hidden">
+  <h2>Users</h2>
+  <p class="muted">Edit guest base_path here to restrict public browsing.</p>
+  <div class="row"><button id="users-load">Refresh</button></div>
+  <div id="users-list"></div>
+</section>
+
+<section id="tab-settings" class="card hidden">
+  <h2>Settings</h2>
+  <div class="grid">
+    <label><span>Site title</span><input id="set-site-title"></label>
+    <label><span>Main color</span><input id="set-main-color"></label>
+    <label><span>Logo URL</span><input id="set-logo"></label>
+    <label><span>Favicon URL</span><input id="set-favicon"></label>
+    <label><span>Link expiration seconds</span><input id="set-link-exp" type="number"></label>
+    <label><span>Sign all downloads</span><select id="set-sign-all"><option value="true">true</option><option value="false">false</option></select></label>
+  </div>
+  <label><span>Announcement</span><textarea id="set-announcement"></textarea></label>
+  <label><span>Customize head</span><textarea id="set-head"></textarea></label>
+  <label><span>Customize body</span><textarea id="set-body"></textarea></label>
+  <p><button id="settings-save" class="primary">Save Settings</button></p>
+</section>
+
+<section id="tab-metas" class="card hidden">
+  <h2>Metadata</h2>
+  <div class="row"><button id="meta-new">New</button><button id="meta-load">Refresh</button></div>
+  <div id="meta-list"></div>
+  <h3 id="meta-form-title">Create Metadata</h3>
+  <input id="meta-id" type="hidden">
+  <div class="grid">
+    <label><span>Path</span><input id="meta-path" value="/"></label>
+    <label><span>Password</span><input id="meta-password"></label>
+  </div>
+  <label><span>README</span><textarea id="meta-readme"></textarea></label>
+  <label><span>Header</span><textarea id="meta-header"></textarea></label>
+  <label><span>Hide rules, one JavaScript RegExp per line</span><textarea id="meta-hide"></textarea></label>
+  <p class="row">
+    <label><span><input id="meta-p-sub" type="checkbox"> Password applies to sub paths</span></label>
+    <label><span><input id="meta-r-sub" type="checkbox"> README applies to sub paths</span></label>
+    <label><span><input id="meta-h-sub" type="checkbox"> Hide applies to sub paths</span></label>
+  </p>
+  <p><button id="meta-save" class="primary">Save Metadata</button></p>
+</section>
+
+<section id="tab-index" class="card hidden">
+  <h2>Search Index</h2>
+  <p class="muted">D1 lightweight index. Very large drives may need repeated builds.</p>
+  <div class="row"><button id="index-build" class="primary">Build / Update</button><button id="index-clear">Clear</button><button id="index-progress">Progress</button></div>
+  <pre id="index-output" class="mono"></pre>
+</section>
 </main>
 ${settings.customize_body || ""}
 <script>
-async function api(path, body) {
-  const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+var token = localStorage.getItem("openlist_token") || "";
+function byId(id){return document.getElementById(id)}
+function show(msg){byId("msg").textContent = msg || ""}
+function esc(s){return String(s == null ? "" : s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]})}
+async function api(path, body, method) {
+  var headers = { "content-type": "application/json" };
+  if (token) headers.authorization = "Bearer " + token;
+  var res = await fetch(path, { method: method || "POST", headers: headers, body: method === "GET" ? undefined : JSON.stringify(body || {}) });
   const json = await res.json();
   if (json.code !== 200) throw new Error(json.message);
   return json.data;
 }
+async function admin(path, body, method){return api(path, body, method)}
+function tab(name){
+  document.querySelectorAll(".tabs button").forEach(function(b){b.classList.toggle("active", b.dataset.tab === name)});
+  document.querySelectorAll("section[id^=tab-]").forEach(function(s){s.classList.add("hidden")});
+  byId("tab-" + name).classList.remove("hidden");
+  show("");
+}
+document.querySelectorAll(".tabs button").forEach(function(b){b.onclick=function(){tab(b.dataset.tab); if(b.dataset.tab==="storages") loadStorages(); if(b.dataset.tab==="users") loadUsers(); if(b.dataset.tab==="settings") loadSettings(); if(b.dataset.tab==="metas") loadMetas();}});
 async function load() {
-  const p = document.getElementById("path").value || "/";
-  const box = document.getElementById("files");
+  const p = byId("path").value || "/";
+  const box = byId("files");
   box.textContent = "Loading...";
   try {
     const data = await api("/api/fs/list", { path: p, page: 1, per_page: 200 });
+    byId("readme").innerHTML = data.readme ? esc(data.readme).replace(/\\n/g,"<br>") : "";
     box.innerHTML = data.content.map(function (item) {
       const child = (p.replace(/\\/$/, "") + "/" + item.name).replace(/\\/+/g, "/");
-      return '<p>' + (item.is_dir ? 'DIR ' : 'FILE ') + '<a href="' + (item.is_dir ? '#" data-path="' + child : item.raw_url || "/d" + child + "?sign=" + encodeURIComponent(item.sign || "") + "&openlist_ts=" + Math.floor(Date.now()/1000)) + '">' + item.name.replace(/[&<>"]/g, function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]}) + '</a></p>';
+      return '<p>' + (item.is_dir ? 'DIR ' : 'FILE ') + '<a href="' + (item.is_dir ? '#" data-path="' + esc(child) : esc(item.raw_url || "/d" + child + "?sign=" + encodeURIComponent(item.sign || "") + "&openlist_ts=" + Math.floor(Date.now()/1000))) + '">' + esc(item.name) + '</a> <span class="muted">' + (item.is_dir ? "" : item.size + " bytes") + '</span></p>';
     }).join("") || "Empty";
-    box.querySelectorAll("a[data-path]").forEach(function (a) { a.onclick = function () { document.getElementById("path").value = a.dataset.path; load(); return false; }; });
+    box.querySelectorAll("a[data-path]").forEach(function (a) { a.onclick = function () { byId("path").value = a.dataset.path; load(); return false; }; });
   } catch (e) {
     box.textContent = e.message;
   }
 }
-document.getElementById("go").onclick = load;
+byId("go").onclick = load;
+byId("up").onclick = function(){var p=byId("path").value.replace(/\\/$/,""); byId("path").value = p.split("/").slice(0,-1).join("/") || "/"; load()};
+
+async function refreshMe(){
+  try{var me=await api("/api/me",{}); byId("who").textContent = me.username + (me.role === 2 ? " (admin)" : ""); byId("logout").classList.toggle("hidden", !token)}
+  catch(e){byId("who").textContent="guest"}
+}
+byId("login-btn").onclick = async function(){
+  try{var data=await api("/api/auth/login",{username:byId("login-user").value,password:byId("login-pass").value}); token=data.token; localStorage.setItem("openlist_token",token); await refreshMe(); tab("storages"); loadStorages(); show("Logged in")}
+  catch(e){show(e.message)}
+};
+byId("logout").onclick = async function(){try{await api("/api/auth/logout",{})}catch(e){} token=""; localStorage.removeItem("openlist_token"); await refreshMe(); tab("files")};
+
+function storagePayload(){
+  return {
+    id: Number(byId("storage-id").value || 0),
+    mount_path: byId("st-mount").value || "/drive",
+    cache_expiration: Number(byId("st-cache").value || 30),
+    disabled: byId("st-disabled").checked,
+    enable_sign: byId("st-sign").checked,
+    order_by: byId("st-order-by").value,
+    order_direction: byId("st-order-dir").value,
+    addition: {
+      root_folder_path: byId("st-root").value || "/",
+      region: byId("st-region").value || "global",
+      client_id: byId("st-client-id").value,
+      client_secret: byId("st-client-secret").value,
+      redirect_uri: byId("st-redirect").value,
+      refresh_token: byId("st-refresh").value,
+      site_id: byId("st-site").value,
+      custom_host: byId("st-host").value
+    }
+  };
+}
+function resetStorage(){["storage-id","st-client-id","st-client-secret","st-refresh","st-site","st-host"].forEach(function(id){byId(id).value=""}); byId("st-mount").value="/drive"; byId("st-root").value="/"; byId("st-region").value="global"; byId("st-cache").value="30"; byId("st-disabled").checked=false; byId("st-sign").checked=false; byId("storage-form-title").textContent="Create Storage"}
+byId("storage-new").onclick=resetStorage;
+byId("storage-load").onclick=loadStorages;
+byId("storage-save").onclick=async function(){try{var p=storagePayload(); await admin("/api/admin/storage/" + (p.id ? "update" : "create"), p); show("Storage saved"); resetStorage(); loadStorages()}catch(e){show(e.message)}};
+async function loadStorages(){
+  try{var data=await admin("/api/admin/storage/list",{page:1,per_page:100}); byId("storage-list").innerHTML='<table class="table"><tr><th>ID</th><th>Mount</th><th>Status</th><th>Action</th></tr>'+data.content.map(function(s){return '<tr><td>'+s.id+'</td><td>'+esc(s.mount_path)+'</td><td>'+esc(s.disabled?"disabled":s.status)+'</td><td><button data-edit="'+s.id+'">Edit</button> <button data-toggle="'+s.id+'" data-disabled="'+s.disabled+'">'+(s.disabled?"Enable":"Disable")+'</button> <button data-del="'+s.id+'">Delete</button></td></tr>'}).join("")+'</table>';
+    byId("storage-list").querySelectorAll("[data-edit]").forEach(function(b){b.onclick=async function(){editStorage(b.dataset.edit)}});
+    byId("storage-list").querySelectorAll("[data-toggle]").forEach(function(b){b.onclick=async function(){await admin("/api/admin/storage/"+(b.dataset.disabled==="true"?"enable":"disable")+"?id="+b.dataset.toggle,{},"GET"); loadStorages()}});
+    byId("storage-list").querySelectorAll("[data-del]").forEach(function(b){b.onclick=async function(){if(confirm("Delete storage?")){await admin("/api/admin/storage/delete?id="+b.dataset.del,{},"GET"); loadStorages()}}});
+  }catch(e){show(e.message)}
+}
+async function editStorage(id){
+  var s=await admin("/api/admin/storage/get?id="+id,{},"GET"); var a={}; try{a=JSON.parse(s.addition||"{}")}catch(e){}
+  byId("storage-id").value=s.id; byId("st-mount").value=s.mount_path; byId("st-root").value=a.root_folder_path||"/"; byId("st-region").value=a.region||"global"; byId("st-client-id").value=a.client_id||""; byId("st-client-secret").value=a.client_secret||""; byId("st-redirect").value=a.redirect_uri||"https://api.oplist.org/onedrive/callback"; byId("st-refresh").value=a.refresh_token||""; byId("st-site").value=a.site_id||""; byId("st-host").value=a.custom_host||""; byId("st-cache").value=s.cache_expiration||30; byId("st-disabled").checked=!!s.disabled; byId("st-sign").checked=!!s.enable_sign; byId("st-order-by").value=s.order_by||""; byId("st-order-dir").value=s.order_direction||""; byId("storage-form-title").textContent="Edit Storage #"+s.id;
+}
+
+byId("users-load").onclick=loadUsers;
+async function loadUsers(){
+  try{var data=await admin("/api/admin/user/list",{page:1,per_page:100}); byId("users-list").innerHTML='<table class="table"><tr><th>ID</th><th>User</th><th>Role</th><th>Base path</th><th>Disabled</th><th>Action</th></tr>'+data.content.map(function(u){return '<tr><td>'+u.id+'</td><td>'+esc(u.username)+'</td><td>'+u.role+'</td><td><input data-base="'+u.id+'" value="'+esc(u.base_path||"/")+'"></td><td><input type="checkbox" data-dis="'+u.id+'" '+(u.disabled?'checked':'')+'></td><td><button data-user-save="'+u.id+'">Save</button></td></tr>'}).join("")+'</table>';
+    byId("users-list").querySelectorAll("[data-user-save]").forEach(function(b){b.onclick=async function(){var id=Number(b.dataset.userSave); var u=data.content.find(function(x){return x.id===id}); u.base_path=byId("users-list").querySelector('[data-base="'+id+'"]').value; u.disabled=byId("users-list").querySelector('[data-dis="'+id+'"]').checked; await admin("/api/admin/user/update",u); show("User saved"); loadUsers()}});
+  }catch(e){show(e.message)}
+}
+
+var settingKeys=["site_title","main_color","logo","favicon","link_expiration","sign_all","announcement","customize_head","customize_body"];
+async function loadSettings(){
+  try{var data=await admin("/api/admin/setting/get?keys="+settingKeys.join(","),{},"GET"); var map={}; data.forEach(function(x){map[x.key]=x}); byId("set-site-title").value=(map.site_title||{}).value||""; byId("set-main-color").value=(map.main_color||{}).value||""; byId("set-logo").value=(map.logo||{}).value||""; byId("set-favicon").value=(map.favicon||{}).value||""; byId("set-link-exp").value=(map.link_expiration||{}).value||"0"; byId("set-sign-all").value=(map.sign_all||{}).value||"true"; byId("set-announcement").value=(map.announcement||{}).value||""; byId("set-head").value=(map.customize_head||{}).value||""; byId("set-body").value=(map.customize_body||{}).value||""}catch(e){show(e.message)}
+}
+byId("settings-save").onclick=async function(){
+  var items=[
+    {key:"site_title",value:byId("set-site-title").value,type:"string",group:1},
+    {key:"main_color",value:byId("set-main-color").value,type:"string",group:2},
+    {key:"logo",value:byId("set-logo").value,type:"text",group:2},
+    {key:"favicon",value:byId("set-favicon").value,type:"string",group:2},
+    {key:"link_expiration",value:byId("set-link-exp").value,type:"number",group:4,flag:1},
+    {key:"sign_all",value:byId("set-sign-all").value,type:"bool",group:4,flag:1},
+    {key:"announcement",value:byId("set-announcement").value,type:"text",group:1},
+    {key:"customize_head",value:byId("set-head").value,type:"text",group:4,flag:1},
+    {key:"customize_body",value:byId("set-body").value,type:"text",group:4,flag:1}
+  ];
+  try{await admin("/api/admin/setting/save",items); show("Settings saved. Refresh page to see HTML changes.")}catch(e){show(e.message)}
+};
+
+function resetMeta(){["meta-id","meta-password","meta-readme","meta-header","meta-hide"].forEach(function(id){byId(id).value=""}); byId("meta-path").value="/"; byId("meta-p-sub").checked=false; byId("meta-r-sub").checked=false; byId("meta-h-sub").checked=false; byId("meta-form-title").textContent="Create Metadata"}
+byId("meta-new").onclick=resetMeta; byId("meta-load").onclick=loadMetas;
+byId("meta-save").onclick=async function(){var p={id:Number(byId("meta-id").value||0),path:byId("meta-path").value,password:byId("meta-password").value,readme:byId("meta-readme").value,header:byId("meta-header").value,hide:byId("meta-hide").value,p_sub:byId("meta-p-sub").checked,r_sub:byId("meta-r-sub").checked,h_sub:byId("meta-h-sub").checked}; try{await admin("/api/admin/meta/"+(p.id?"update":"create"),p); show("Metadata saved"); resetMeta(); loadMetas()}catch(e){show(e.message)}};
+async function loadMetas(){try{var data=await admin("/api/admin/meta/list",{page:1,per_page:100}); byId("meta-list").innerHTML='<table class="table"><tr><th>ID</th><th>Path</th><th>Action</th></tr>'+data.content.map(function(m){return '<tr><td>'+m.id+'</td><td>'+esc(m.path)+'</td><td><button data-meta-edit="'+m.id+'">Edit</button> <button data-meta-del="'+m.id+'">Delete</button></td></tr>'}).join("")+'</table>'; byId("meta-list").querySelectorAll("[data-meta-edit]").forEach(function(b){b.onclick=async function(){var m=await admin("/api/admin/meta/get?id="+b.dataset.metaEdit,{},"GET"); byId("meta-id").value=m.id; byId("meta-path").value=m.path; byId("meta-password").value=m.password||""; byId("meta-readme").value=m.readme||""; byId("meta-header").value=m.header||""; byId("meta-hide").value=m.hide||""; byId("meta-p-sub").checked=!!m.p_sub; byId("meta-r-sub").checked=!!m.r_sub; byId("meta-h-sub").checked=!!m.h_sub; byId("meta-form-title").textContent="Edit Metadata #"+m.id}}); byId("meta-list").querySelectorAll("[data-meta-del]").forEach(function(b){b.onclick=async function(){if(confirm("Delete metadata?")){await admin("/api/admin/meta/delete?id="+b.dataset.metaDel,{},"GET"); loadMetas()}}})}catch(e){show(e.message)}}
+
+byId("index-build").onclick=async function(){try{byId("index-output").textContent="Running..."; byId("index-output").textContent=JSON.stringify(await admin("/api/admin/index/build",{}),null,2)}catch(e){show(e.message)}};
+byId("index-clear").onclick=async function(){try{byId("index-output").textContent=JSON.stringify(await admin("/api/admin/index/clear",{}),null,2)}catch(e){show(e.message)}};
+byId("index-progress").onclick=async function(){try{byId("index-output").textContent=JSON.stringify(await admin("/api/admin/index/progress",{},"GET"),null,2)}catch(e){show(e.message)}};
+
+refreshMe();
 load();
 </script>
 </body>
 </html>`;
-  return htmlResponse(fallback);
 }
 
 function injectHtml(html, settings, cdn) {
@@ -945,7 +1169,8 @@ async function signedDownloadUrl(env, reqPath, storage) {
 
 async function objResp(env, obj, parent, storage) {
   const reqPath = joinPath(parent, obj.name);
-  const sign = obj.is_dir ? "" : await pathSign(env, reqPath, nowSeconds());
+  const ts = nowSeconds();
+  const sign = obj.is_dir ? "" : await pathSign(env, reqPath, ts);
   return {
     name: obj.name,
     size: obj.size || 0,
@@ -957,7 +1182,7 @@ async function objResp(env, obj, parent, storage) {
     type: objType(obj.name, !!obj.is_dir),
     hashinfo: "",
     hash_info: {},
-    raw_url: obj.is_dir ? "" : `/d${encodeURI(reqPath)}?sign=${encodeURIComponent(sign)}&openlist_ts=${nowSeconds()}`,
+    raw_url: obj.is_dir ? "" : `/d${encodeURI(reqPath)}?sign=${encodeURIComponent(sign)}&openlist_ts=${ts}`,
   };
 }
 

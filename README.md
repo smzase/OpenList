@@ -9,7 +9,7 @@
 - 支持 OneDrive / SharePoint 挂载。
 - 支持公开访问，未登录用户使用内置 `guest` 用户。
 - 支持设置 `guest` 的 `base_path`，限制公开用户只能访问指定目录。
-- 支持管理员登录。
+- 支持内置管理前端和管理员登录。
 - 支持用户、设置、存储、元信息、轻量索引管理接口。
 - 支持自定义站点标题、Logo、favicon、主色、头部内容和页面内容。
 - 支持元信息：README、Header、密码、隐藏规则、读写用户字段。
@@ -41,7 +41,7 @@ cloudflare-pages/
   wrangler.toml.example
 ```
 
-- `dist/index.html`：Cloudflare Pages 静态入口。未配置前端 CDN 时会显示内置轻量页面。
+- `dist/index.html`：Cloudflare Pages 静态入口。实际页面由 Pages Functions 提供内置管理前端。
 - `dist/_routes.json`：让所有路径都进入 Pages Functions。
 - `functions/[[path]].js`：Pages Functions 后端逻辑。
 - `schema.sql`：D1 数据库表结构。
@@ -67,7 +67,7 @@ cloudflare-pages/
    - `OPENLIST_ADMIN_USERNAME`：初始管理员用户名，例如 `admin`
    - `OPENLIST_ADMIN_PASSWORD`：初始管理员密码
    - `OPENLIST_JWT_SECRET`：用于签名下载链接的长随机字符串
-   - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；留空则使用内置轻量页面
+   - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；留空则使用内置管理前端
 10. 部署 Pages 项目。
 
 如果构建日志出现 `Output directory "cloudflare-pages/dist" not found`，通常是下面两种原因之一：
@@ -85,6 +85,8 @@ cloudflare-pages/
 4. 如果只想公开指定目录，编辑 `guest` 用户，将 `base_path` 设置为对应挂载路径，例如 `/public`。
 5. 根据需要配置元信息、直链有效期、自定义头部和自定义内容。
 6. 如需搜索，进入索引管理构建 D1 轻量索引。
+
+默认不需要配置 `OPENLIST_WEB_CDN`。留空时会使用项目内置前端，可以完成文件浏览、登录、添加 OneDrive 存储、修改 guest 路径、配置设置、配置元信息和构建索引。
 
 ## OneDrive 存储配置
 
