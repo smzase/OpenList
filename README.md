@@ -70,6 +70,13 @@ cloudflare-pages/
    - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；留空则使用内置轻量页面
 10. 部署 Pages 项目。
 
+如果构建日志出现 `Output directory "cloudflare-pages/dist" not found`，通常是下面两种原因之一：
+
+- Cloudflare 部署的提交还没有包含本仓库的 `cloudflare-pages/` 目录。请先把当前改动提交并推送到 GitHub，再重新部署。
+- Pages 设置里 Root directory 和 Build output directory 填错了。推荐配置是 Root directory 填 `cloudflare-pages`，Build output directory 只填 `dist`，不要填 `cloudflare-pages/dist`。
+
+如果日志里显示的提交哈希仍是旧提交，说明 Cloudflare Pages 还没有拉到包含 Pages 版代码的新提交。
+
 ## 首次使用
 
 1. 访问你的 Pages 域名。
