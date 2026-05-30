@@ -80,8 +80,8 @@ async function downloadAndExtract(url) {
     JSON.stringify(
       {
         version: 1,
-        include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
-        exclude: [],
+        include: ["/*"],
+        exclude: ["/assets/*", "/images/*", "/static/*", "/streamer/*", "/VERSION"],
       },
       null,
       2,
