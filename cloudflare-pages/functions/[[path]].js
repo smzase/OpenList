@@ -78,7 +78,7 @@ const DEFAULT_SETTINGS = [
   item("ocr_api", "https://openlistteam-ocr-api-server.hf.space/ocr/file/json", "string", GROUPS.GLOBAL),
   item("filename_char_mapping", "{\"/\":\"|\"}", "text", GROUPS.GLOBAL),
   item("forward_direct_link_params", "false", "bool", GROUPS.GLOBAL),
-  item("ignore_direct_link_params", "sign,openlist_ts,raw", "string", GROUPS.GLOBAL),
+  item("ignore_direct_link_params", "sign,sign_ts,openlist_ts,raw", "string", GROUPS.GLOBAL),
   item("webauthn_login_enabled", "false", "bool", GROUPS.GLOBAL),
   item("share_preview", "false", "bool", GROUPS.GLOBAL),
   item("share_archive_preview", "false", "bool", GROUPS.GLOBAL),
@@ -745,12 +745,13 @@ async function downloadRouter(request, env, path) {
   if (!found.obj || found.obj.is_dir) return text("not found", 404);
   const url = new URL(request.url);
   const sign = url.searchParams.get("sign") || "";
-  const ts = Number(url.searchParams.get("openlist_ts") || "0");
+  const signTs = Number(url.searchParams.get("sign_ts") || url.searchParams.get("openlist_ts") || "0");
   const mustSign = boolSetting(await getSetting(env, "sign_all", "true")) || truthy(found.storage.enable_sign);
   if (mustSign) {
-    if (!sign || !(await verifyPathSign(env, reqPath, ts, sign))) return text("invalid sign", 403);
+    const verified = await verifyDownloadSign(env, reqPath, sign, signTs);
+    if (!verified.ok) return text("invalid sign", 403);
     const expiration = Number(await getSetting(env, "link_expiration", "0"));
-    if (expiration > 0 && (!ts || nowSeconds() - ts > expiration)) return text("link expired", 403);
+    if (expiration > 0 && (!verified.ts || nowSeconds() - verified.ts > expiration)) return text("link expired", 403);
   }
   const downloadUrl = await oneDriveDownloadUrl(env, found.storage, reqPath);
   return Response.redirect(downloadUrl, 302);
@@ -1367,14 +1368,14 @@ async function favicon(env) {
 
 async function signedDownloadUrl(env, reqPath, storage) {
   const ts = nowSeconds();
-  const sign = await pathSign(env, reqPath, ts);
-  return `/d${encodeURI(reqPath)}?sign=${encodeURIComponent(sign)}&openlist_ts=${ts}`;
+  const sign = await downloadSign(env, reqPath, ts);
+  return `/d${encodeDownloadPath(reqPath)}?sign=${encodeURIComponent(sign)}&sign_ts=${ts}&openlist_ts=${ts}`;
 }
 
 async function objResp(env, obj, parent, storage) {
   const reqPath = joinPath(parent, obj.name);
   const ts = nowSeconds();
-  const sign = obj.is_dir ? "" : await pathSign(env, reqPath, ts);
+  const sign = obj.is_dir ? "" : await downloadSign(env, reqPath, ts);
   return {
     name: obj.name,
     size: obj.size || 0,
@@ -1386,7 +1387,7 @@ async function objResp(env, obj, parent, storage) {
     type: objType(obj.name, !!obj.is_dir),
     hashinfo: "",
     hash_info: {},
-    raw_url: obj.is_dir ? "" : `/d${encodeURI(reqPath)}?sign=${encodeURIComponent(sign)}&openlist_ts=${ts}`,
+    raw_url: obj.is_dir ? "" : `/d${encodeDownloadPath(reqPath)}?sign=${encodeURIComponent(sign)}&sign_ts=${ts}&openlist_ts=${ts}`,
   };
 }
 
@@ -1669,9 +1670,27 @@ async function pathSign(env, path, ts) {
   return hmacHex(secret, `${normalizePath(path)}:${ts || 0}`);
 }
 
-async function verifyPathSign(env, path, ts, sign) {
-  const expected = await pathSign(env, path, ts);
-  return timingSafeEqual(expected, sign);
+async function downloadSign(env, path, ts) {
+  const signTs = Number(ts || nowSeconds());
+  return `${signTs}:${await pathSign(env, path, signTs)}`;
+}
+
+async function verifyDownloadSign(env, path, sign, explicitTs) {
+  sign = String(sign || "");
+  const embedded = /^(\d{1,16}):([a-f0-9]{64})$/i.exec(sign);
+  if (embedded) {
+    const ts = Number(embedded[1]);
+    const expected = await pathSign(env, path, ts);
+    return { ok: timingSafeEqual(expected, embedded[2].toLowerCase()), ts };
+  }
+
+  if (explicitTs) {
+    const expected = await pathSign(env, path, explicitTs);
+    if (timingSafeEqual(expected, sign)) return { ok: true, ts: explicitTs };
+  }
+
+  const unsignedTsExpected = await pathSign(env, path, 0);
+  return { ok: timingSafeEqual(unsignedTsExpected, sign), ts: 0 };
 }
 
 async function passwordHashFromRaw(password, salt) {
@@ -1792,6 +1811,10 @@ function normalizePath(input) {
 
 function joinPath(...parts) {
   return normalizePath(parts.filter((x) => x !== undefined && x !== null).join("/"));
+}
+
+function encodeDownloadPath(path) {
+  return normalizePath(path).split("/").map((part) => encodeURIComponent(part)).join("/");
 }
 
 function joinBasePath(base, req) {
