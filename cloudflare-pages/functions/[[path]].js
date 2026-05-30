@@ -173,18 +173,24 @@ async function apiRouter(request, env, path) {
   if (path === "/api/public/offline_download_tools") return ok([]);
   if (path === "/api/public/archive_extensions") return ok([]);
   if (path === "/api/auth/login" || path === "/api/auth/login/hash") return login(request, env, path.endsWith("/hash"));
+  if (path === "/api/auth/login/ldap") return apiError("LDAP login is not supported in Cloudflare Pages mode", 400);
+  if (path === "/api/auth/sso") return apiError("SSO login is not supported in Cloudflare Pages mode", 400);
   if (path === "/api/auth/logout") return logout(request, env);
   if (path === "/api/me") return currentUser(request, env);
   if (path === "/api/me/update") return requireLogin(request, env, (user) => updateCurrentUser(request, env, user));
   if (path === "/api/auth/2fa/generate") return apiError("2FA is not supported in Cloudflare Pages mode", 400);
   if (path === "/api/auth/2fa/verify") return apiError("2FA is not supported in Cloudflare Pages mode", 400);
-  if (path === "/api/me/sshkey/list") return requireLogin(request, env, () => ok([]));
+  if (path === "/api/authn/getcredentials") return requireLogin(request, env, () => ok([]));
+  if (path === "/api/authn/delete_authn") return requireLogin(request, env, () => ok());
+  if (path.startsWith("/api/authn/")) return apiError("WebAuthn is not supported in Cloudflare Pages mode", 400);
+  if (path === "/api/me/sshkey/list") return requireLogin(request, env, () => ok({ content: [], total: 0 }));
   if (path === "/api/me/sshkey/add") return requireLogin(request, env, () => apiError("SSH keys are not supported in Cloudflare Pages mode", 400));
   if (path === "/api/me/sshkey/delete") return requireLogin(request, env, () => ok());
   if (path === "/api/fs/list") return fsList(request, env);
   if (path === "/api/fs/get") return fsGet(request, env);
   if (path === "/api/fs/dirs") return fsDirs(request, env);
   if (path === "/api/fs/search") return fsSearch(request, env);
+  if (path.startsWith("/api/fs/")) return fsCompat(request, env, path);
   if (path.startsWith("/api/task/")) return requireLogin(request, env, (user) => taskCompat(request, env, path, user));
   if (path.startsWith("/api/share/")) return requireLogin(request, env, (user) => shareCompat(request, env, path, user));
   if (path === "/api/admin/driver/list") return requireAdmin(request, env, () => ok({ Onedrive: ONEDRIVE_DRIVER_INFO }));
@@ -599,6 +605,20 @@ async function shareCompat(request, env, path, user) {
   if (path.endsWith("/create") || path.endsWith("/update")) return ok({ id: String((await readBody(request)).id || "") });
   if (path.endsWith("/delete") || path.endsWith("/enable") || path.endsWith("/disable")) return ok();
   return apiError("Share is not supported in Cloudflare Pages mode", 404);
+}
+
+async function fsCompat(request, env, path) {
+  if (path.endsWith("/get_direct_upload_info")) return ok(null);
+  if (path.endsWith("/archive/meta")) return apiError("Archive preview is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/archive/list")) return apiError("Archive preview is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/torrent/parse")) return apiError("Torrent parsing is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/torrent/rapid_upload")) return apiError("Torrent rapid upload is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/add_offline_download")) return apiError("Offline download is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/form") || path.endsWith("/put")) return apiError("Upload is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/mkdir") || path.endsWith("/rename") || path.endsWith("/batch_rename")) return apiError("File modification is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/move") || path.endsWith("/recursive_move") || path.endsWith("/copy")) return apiError("File modification is not supported in Cloudflare Pages mode", 400);
+  if (path.endsWith("/remove") || path.endsWith("/remove_empty_directory")) return apiError("File deletion is not supported in Cloudflare Pages mode", 400);
+  return apiError("This file API is not supported in Cloudflare Pages mode", 400);
 }
 
 function adminCompat(path) {
