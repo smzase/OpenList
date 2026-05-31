@@ -17,7 +17,7 @@ const PUBLIC_CONFIG_TTL = 300;
 const RUNTIME_MEMORY_TTL = 300;
 const SESSION_CACHE_SECONDS = 60;
 const LONG_CACHE_SECONDS = 30 * 24 * 3600;
-const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v2";
+const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v3";
 let initPromise = null;
 let initializedUntil = 0;
 let runtimeCacheNamespace = "default";
@@ -161,7 +161,7 @@ export async function onRequest(context) {
 
     if (isStaticAssetRequest(path) && !isDynamicAssetRoute(path) && env.ASSETS) {
       const assetResp = await env.ASSETS.fetch(request);
-      if (assetResp.status !== 404) return assetResp;
+      if (assetResp.status !== 404) return staticAssetResponse(assetResp, path);
     }
 
     if (!env.OPENLIST_DB) {
@@ -171,7 +171,7 @@ export async function onRequest(context) {
 
     if (isStaticAssetRequest(path) && !isDynamicAssetRoute(path) && env.ASSETS) {
       const assetResp = await env.ASSETS.fetch(request);
-      if (assetResp.status !== 404) return assetResp;
+      if (assetResp.status !== 404) return staticAssetResponse(assetResp, path);
     }
     if (path === "/ping") return text("pong");
     if (path === "/manifest.json") return manifest(env, request);
@@ -1509,6 +1509,7 @@ load();
 function injectHtml(html, settings, cdn) {
   const manifestPath = "/manifest.json";
   let out = html
+    .replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "")
     .replace("cdn: undefined", `cdn: '${cdn}'`)
     .replace("base_path: undefined", "base_path: '/'")
     .replace("main_color: undefined", `main_color: '${settings.main_color || "#1890ff"}'`)
@@ -1608,6 +1609,20 @@ function isStaticAssetRequest(path) {
     return true;
   }
   return /\.(?:js|mjs|css|map|png|jpg|jpeg|gif|svg|ico|webp|avif|woff2?|ttf|wasm|json|txt)$/i.test(path);
+}
+
+function staticAssetResponse(resp, path) {
+  const headers = new Headers(resp.headers);
+  if (path.startsWith("/assets/") || /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(path)) {
+    headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  } else {
+    headers.set("Cache-Control", "public, max-age=86400");
+  }
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+  });
 }
 
 function isDynamicAssetRoute(path) {
