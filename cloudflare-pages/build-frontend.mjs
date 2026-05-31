@@ -7,41 +7,6 @@ import { fileURLToPath } from "node:url";
 const root = dirname(fileURLToPath(import.meta.url));
 const distDir = resolve(root, "dist");
 const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
-const customizeBootstrap = `<script id="openlist-pages-customize">
-  (function () {
-    function appendHtml(target, html) {
-      if (!target || !html) return;
-      var template = document.createElement("template");
-      template.innerHTML = html;
-      var scripts = Array.prototype.slice.call(template.content.querySelectorAll("script")).map(function (oldScript) {
-        var script = document.createElement("script");
-        for (var i = 0; i < oldScript.attributes.length; i++) {
-          var attr = oldScript.attributes[i];
-          script.setAttribute(attr.name, attr.value);
-        }
-        script.text = oldScript.textContent || "";
-        oldScript.parentNode.removeChild(oldScript);
-        return script;
-      });
-      target.appendChild(template.content);
-      scripts.forEach(function (script) {
-        target.appendChild(script);
-      });
-    }
-    function appendBody(html) {
-      if (document.body) appendHtml(document.body, html);
-      else document.addEventListener("DOMContentLoaded", function () { appendHtml(document.body, html); }, { once: true });
-    }
-    fetch("/api/public/settings", { headers: { accept: "application/json" }, cache: "no-store" })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (payload) {
-        var data = payload && payload.data ? payload.data : {};
-        appendHtml(document.head, data.customize_head);
-        appendBody(data.customize_body);
-      })
-      .catch(function () {});
-  })();
-</script>`;
 
 const repo = process.env.OPENLIST_FRONTEND_REPO || "OpenListTeam/OpenList-Frontend";
 const version = process.env.OPENLIST_FRONTEND_VERSION || "latest";
@@ -60,6 +25,31 @@ const headers = {
 if (process.env.GITHUB_TOKEN) {
   headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 }
+
+const pagesRoutes = {
+  version: 1,
+  include: ["/*"],
+  exclude: ["/assets/*", "/images/*", "/static/*", "/streamer/*", "/VERSION"],
+};
+
+const pagesHeaders = `/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/images/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/static/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/streamer/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/VERSION
+  Cache-Control: public, max-age=3600
+
+/index.html
+  Cache-Control: no-store
+`;
 
 async function main() {
   console.log(`Downloading OpenList frontend directly: ${directUrl}`);
@@ -111,18 +101,8 @@ async function downloadAndExtract(url) {
 
   await rm(tmpTar, { force: true });
   await patchIndexHtml();
-  await writeFile(
-    resolve(distDir, "_routes.json"),
-    JSON.stringify(
-      {
-        version: 1,
-        include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
-        exclude: [],
-      },
-      null,
-      2,
-    ) + "\n",
-  );
+  await writeFile(resolve(distDir, "_routes.json"), JSON.stringify(pagesRoutes, null, 2) + "\n");
+  await writeFile(resolve(distDir, "_headers"), pagesHeaders);
   await writeFile(resolve(distDir, "_redirects"), "/* /index.html 200\n");
   console.log("OpenList frontend has been written to cloudflare-pages/dist");
   return true;
@@ -131,13 +111,7 @@ async function downloadAndExtract(url) {
 async function patchIndexHtml() {
   const indexPath = resolve(distDir, "index.html");
   let html = await readFile(indexPath, "utf8");
-  if (html.includes('id="openlist-pages-customize"')) return;
-  const marker = "<!-- customize head -->";
-  if (html.includes(marker)) {
-    html = html.replace(marker, `${marker}\n    ${customizeBootstrap.replace(/\n/g, "\n    ")}`);
-  } else {
-    html = html.replace("</head>", `    ${customizeBootstrap.replace(/\n/g, "\n    ")}\n  </head>`);
-  }
+  html = html.replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "");
   await writeFile(indexPath, html);
 }
 

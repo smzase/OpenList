@@ -36,14 +36,16 @@ cloudflare-pages/
   dist/
     index.html
     _routes.json
+    _headers
   functions/
     [[path]].js
   schema.sql
   wrangler.toml.example
 ```
 
-- `dist/index.html`：Cloudflare Pages 静态入口。部署时会下载官方 OpenList 前端并写入这里。
-- `dist/_routes.json`：只让 `/api/*`、`/d/*` 等后端路由进入 Pages Functions，前端静态文件由 Pages 直接服务。
+- `dist/index.html`：内置官方 OpenList 前端入口。
+- `dist/_routes.json`：让页面和 API 进入 Pages Functions，`/assets/*`、`/static/*` 等前端资源仍由 Pages 静态层直接服务。
+- `dist/_headers`：给前端静态资源设置长期浏览器缓存。
 - `dist/_redirects`：让前端路由刷新时回到 `index.html`。
 - `functions/[[path]].js`：Pages Functions 后端逻辑。
 - `schema.sql`：D1 数据库表结构。
