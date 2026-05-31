@@ -188,8 +188,8 @@ export async function onRequest(context) {
 
 async function apiRouter(request, env, path) {
   if (path === "/api/public/settings") return publicSettings(env);
-  if (path === "/api/public/offline_download_tools") return ok([]);
-  if (path === "/api/public/archive_extensions") return ok([]);
+  if (path === "/api/public/offline_download_tools") return ok([], { "Cache-Control": "public, max-age=86400" });
+  if (path === "/api/public/archive_extensions") return ok([], { "Cache-Control": "public, max-age=86400" });
   if (path === "/api/auth/login" || path === "/api/auth/login/hash") return login(request, env, path.endsWith("/hash"));
   if (path === "/api/auth/login/ldap") return apiError("LDAP login is not supported in Cloudflare Pages mode", 400);
   if (path === "/api/auth/sso") return apiError("SSO login is not supported in Cloudflare Pages mode", 400);
@@ -874,8 +874,16 @@ async function listPath(env, reqPath) {
       return { content: cachedContent, storage };
     }
   }
-  const tag = cacheSeconds > 0 ? await oneDriveFolderTag(env, storage, reqPath).catch(() => "") : "";
-  const items = await oneDriveList(env, storage, reqPath);
+  let tag = "";
+  let items = [];
+  if (cacheSeconds > 0) {
+    [tag, items] = await Promise.all([
+      oneDriveFolderTag(env, storage, reqPath).catch(() => ""),
+      oneDriveList(env, storage, reqPath),
+    ]);
+  } else {
+    items = await oneDriveList(env, storage, reqPath);
+  }
   const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
   if (cacheSeconds > 0) {
     await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
@@ -2232,8 +2240,8 @@ function driverItem(name, type = "string", defaultValue = "", options = "", requ
   return { name, type, default: defaultValue, options, required, help };
 }
 
-function ok(data = null) {
-  return json({ code: 200, message: "success", data });
+function ok(data = null, headers = {}) {
+  return json({ code: 200, message: "success", data }, 200, headers);
 }
 
 function apiError(message, code = 500) {
