@@ -17,6 +17,7 @@ const PUBLIC_CONFIG_TTL = 300;
 const RUNTIME_MEMORY_TTL = 300;
 const SESSION_CACHE_SECONDS = 60;
 const LONG_CACHE_SECONDS = 30 * 24 * 3600;
+const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v2";
 let initPromise = null;
 let initializedUntil = 0;
 
@@ -1522,6 +1523,7 @@ async function frontendHtmlCacheKey(env, settings, cdn) {
   const version = env.OPENLIST_FRONTEND_CACHE_VERSION || env.CF_PAGES_COMMIT_SHA || env.CF_PAGES_DEPLOYMENT_ID || "default";
   const data = {
     version,
+    builtin_admin_script: BUILTIN_ADMIN_SCRIPT_VERSION,
     cdn,
     site_title: settings.site_title || "",
     favicon: settings.favicon || "",
@@ -1615,9 +1617,10 @@ async function publicSettings(env) {
 }
 
 async function publicSettingsMap(env) {
+  const cacheKey = `settings:public:${BUILTIN_ADMIN_SCRIPT_VERSION}`;
   const cached = memoryGet("settings:public");
   if (cached !== undefined) return cached;
-  const bundled = await getRuntimeCache("settings:public");
+  const bundled = await getRuntimeCache(cacheKey);
   if (bundled && typeof bundled === "object" && !Array.isArray(bundled)) {
     memorySet("settings:public", bundled, SETTINGS_MEMORY_TTL);
     return bundled;
@@ -1637,7 +1640,8 @@ async function publicSettingsMap(env) {
   for (const row of rows) {
     if (row.flag !== FLAG_PRIVATE || exposedPrivate.has(row.key)) data[row.key] = row.value;
   }
-  await setRuntimeCache("settings:public", data, PUBLIC_CONFIG_TTL);
+  data.customize_body = `${storageCacheRefreshScript()}${data.customize_body || ""}`;
+  await setRuntimeCache(cacheKey, data, PUBLIC_CONFIG_TTL);
   memorySet("settings:public", data, SETTINGS_MEMORY_TTL);
   return data;
 }
@@ -2266,6 +2270,7 @@ async function clearSettingsCache(env) {
   clearSettingsMemory();
   await deleteRuntimeCache("settings:map");
   await deleteRuntimeCache("settings:public");
+  await deleteRuntimeCache(`settings:public:${BUILTIN_ADMIN_SCRIPT_VERSION}`);
 }
 
 function clearStorageMemory() {
