@@ -10,6 +10,14 @@ const STATIC_HASH_SALT = "https://github.com/alist-org/alist";
 const WORK_STATUS = "work";
 
 const DEFAULT_WEB_CDN = "https://res.oplist.org";
+const MEM_CACHE = new Map();
+const VOLATILE_SETTING_KEYS = new Set(["index_progress", "scan_progress"]);
+const SETTINGS_MEMORY_TTL = 60;
+const PUBLIC_CONFIG_TTL = 300;
+const RUNTIME_MEMORY_TTL = 300;
+const SESSION_CACHE_SECONDS = 60;
+let initPromise = null;
+let initializedUntil = 0;
 
 const GROUPS = {
   SINGLE: 0,
@@ -144,14 +152,20 @@ const ONEDRIVE_DRIVER_INFO = {
 export async function onRequest(context) {
   const { request, env } = context;
   try {
+    const url = new URL(request.url);
+    const path = normalizePath(url.pathname);
+
+    if (isStaticAssetRequest(path) && !isDynamicAssetRoute(path) && env.ASSETS) {
+      const assetResp = await env.ASSETS.fetch(request);
+      if (assetResp.status !== 404) return assetResp;
+    }
+
     if (!env.OPENLIST_DB) {
       return text("OPENLIST_DB D1 binding is missing", 500);
     }
     await ensureInitialized(env);
-    const url = new URL(request.url);
-    const path = normalizePath(url.pathname);
 
-    if (isStaticAssetRequest(path) && env.ASSETS) {
+    if (isStaticAssetRequest(path) && !isDynamicAssetRoute(path) && env.ASSETS) {
       const assetResp = await env.ASSETS.fetch(request);
       if (assetResp.status !== 404) return assetResp;
     }
@@ -213,7 +227,33 @@ async function apiRouter(request, env, path) {
 }
 
 async function ensureInitialized(env) {
+  if (initializedUntil > nowSeconds()) return;
+  if (!initPromise) {
+    initPromise = initializeIfNeeded(env).finally(() => {
+      initPromise = null;
+    });
+  }
+  await initPromise;
+  initializedUntil = nowSeconds() + 3600;
+}
+
+async function initializeIfNeeded(env) {
   const db = env.OPENLIST_DB;
+  const ready = await db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM settings WHERE key IN ('version', 'token')) AS settings_count,
+      (SELECT COUNT(*) FROM users WHERE role = ?) AS admin_count,
+      (SELECT COUNT(*) FROM users WHERE role = ?) AS guest_count
+  `).bind(ROLE_ADMIN, ROLE_GUEST).first();
+
+  if (
+    Number(ready?.settings_count || 0) >= 2 &&
+    Number(ready?.admin_count || 0) > 0 &&
+    Number(ready?.guest_count || 0) > 0
+  ) {
+    return;
+  }
+
   await db.prepare("INSERT OR IGNORE INTO settings (key, value, help, type, options, group_id, flag, item_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
     .bind("token", await randomToken(), "", "string", "", GROUPS.SINGLE, FLAG_PRIVATE, 0)
     .run();
@@ -242,6 +282,8 @@ async function ensureInitialized(env) {
       .bind(ROLE_GUEST)
       .run();
   }
+  await clearSettingsCache(env);
+  clearMemoryPrefix("");
 }
 
 async function login(request, env, passwordIsStaticHash) {
@@ -259,12 +301,16 @@ async function login(request, env, passwordIsStaticHash) {
   await env.OPENLIST_DB.prepare("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)")
     .bind(token, user.id, expires)
     .run();
+  memorySet(`session:${token}`, user, SESSION_CACHE_SECONDS);
   return ok({ token });
 }
 
 async function logout(request, env) {
   const token = bearerToken(request);
-  if (token) await env.OPENLIST_DB.prepare("DELETE FROM sessions WHERE token = ?").bind(token).run();
+  if (token) {
+    await env.OPENLIST_DB.prepare("DELETE FROM sessions WHERE token = ?").bind(token).run();
+    memoryDelete(`session:${token}`);
+  }
   return ok();
 }
 
@@ -277,24 +323,45 @@ async function currentUser(request, env) {
 async function getRequestUser(request, env, allowDisabledGuest) {
   const token = bearerToken(request);
   if (token) {
-    const row = await env.OPENLIST_DB.prepare(
-      "SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ? AND sessions.expires_at > ? LIMIT 1"
-    ).bind(token, nowSeconds()).first();
+    const sessionKey = `session:${token}`;
+    let row = memoryGet(sessionKey);
+    if (row === undefined) {
+      row = await env.OPENLIST_DB.prepare(
+        "SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ? AND sessions.expires_at > ? LIMIT 1"
+      ).bind(token, nowSeconds()).first();
+      memorySet(sessionKey, row || null, SESSION_CACHE_SECONDS);
+    }
     if (row && !row.disabled) return row;
   }
-  const guest = await env.OPENLIST_DB.prepare("SELECT * FROM users WHERE role = ? LIMIT 1").bind(ROLE_GUEST).first();
+  const guest = await getGuestUser(env);
   if (!guest) return null;
   if (guest.disabled && !allowDisabledGuest) return null;
   return guest;
 }
 
+async function getGuestUser(env) {
+  let guest = memoryGet("user:guest");
+  if (guest !== undefined) return guest;
+  guest = await getRuntimeCache("user:guest");
+  if (guest !== null) {
+    memorySet("user:guest", guest, PUBLIC_CONFIG_TTL);
+    return guest;
+  }
+  guest = await env.OPENLIST_DB.prepare("SELECT id, username, base_path, role, disabled, permission, allow_ldap FROM users WHERE role = ? LIMIT 1").bind(ROLE_GUEST).first();
+  memorySet("user:guest", guest || null, PUBLIC_CONFIG_TTL);
+  if (guest) await setRuntimeCache("user:guest", guest, PUBLIC_CONFIG_TTL);
+  return guest || null;
+}
+
 async function requireAdmin(request, env, handler) {
+  if (!bearerToken(request)) return apiError("permission denied", 403);
   const user = await getRequestUser(request, env, true);
   if (!user || user.role !== ROLE_ADMIN || user.disabled) return apiError("permission denied", 403);
   return handler(user);
 }
 
 async function requireLogin(request, env, handler) {
+  if (!bearerToken(request)) return apiError("login required", 401);
   const user = await getRequestUser(request, env, false);
   if (!user || user.role === ROLE_GUEST) return apiError("login required", 401);
   return handler(user);
@@ -313,6 +380,7 @@ async function updateCurrentUser(request, env, user) {
   await env.OPENLIST_DB.prepare("UPDATE users SET username = ?, pwd_hash = ?, pwd_ts = ?, salt = ?, sso_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(String(body.username || user.username), pwdHash, pwdTs, salt, String(body.sso_id || user.sso_id || ""), user.id)
     .run();
+  await clearUserCache(env);
   return ok();
 }
 
@@ -345,6 +413,7 @@ async function adminUser(request, env, path, admin) {
     await db.prepare("INSERT INTO users (username, pwd_hash, pwd_ts, salt, base_path, role, disabled, permission, authn, allow_ldap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)")
       .bind(String(body.username || ""), pwdHash, nowSeconds(), salt, normalizePath(body.base_path || "/"), ROLE_GENERAL, boolInt(body.disabled), Number(body.permission || 0), boolInt(body.allow_ldap ?? true))
       .run();
+    await clearUserCache(env);
     return ok();
   }
   if (path.endsWith("/update")) {
@@ -365,6 +434,7 @@ async function adminUser(request, env, path, admin) {
       .bind(String(body.username || current.username), pwdHash, pwdTs, salt, normalizePath(body.base_path || "/"), boolInt(body.disabled), Number(body.permission || 0), String(body.sso_id || ""), boolInt(body.allow_ldap ?? true), Number(body.id))
       .run();
     if (admin.id !== Number(body.id)) await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(Number(body.id)).run();
+    await clearUserCache(env);
     return ok();
   }
   if (path.endsWith("/delete")) {
@@ -374,6 +444,7 @@ async function adminUser(request, env, path, admin) {
     if (user.role === ROLE_ADMIN || user.role === ROLE_GUEST) return apiError("admin or guest user can not be deleted", 400);
     await db.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
     await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+    await clearUserCache(env);
     return ok();
   }
   if (path.endsWith("/cancel_2fa")) {
@@ -424,12 +495,14 @@ async function adminSetting(request, env, path) {
         .bind(String(s.key), String(s.value ?? ""), String(s.help ?? ""), String(s.type || "string"), String(s.options || ""), Number(s.group ?? s.group_id ?? 0), Number(s.flag ?? 0), Number(s.index ?? s.item_index ?? 0))
         .run();
     }
+    await clearSettingsCache(env);
     return ok();
   }
   if (path.endsWith("/delete")) {
     const key = new URL(request.url).searchParams.get("key");
     if (!key) return apiError("key is required", 400);
     await db.prepare("DELETE FROM settings WHERE key = ?").bind(key).run();
+    await clearSettingsCache(env);
     return ok();
   }
   if (path.endsWith("/default")) {
@@ -475,6 +548,7 @@ async function adminStorage(request, env, path) {
       .run();
     const id = result.meta.last_row_id;
     await saveOneDriveToken(env, id, parseJson(body.addition));
+    await clearStorageCache(env);
     return ok({ id });
   }
   if (path.endsWith("/update")) {
@@ -484,7 +558,7 @@ async function adminStorage(request, env, path) {
       .bind(body.mount_path, body.order, body.cache_expiration, body.custom_cache_policies, body.addition, body.remark, body.disabled, body.disable_index, body.enable_sign, body.order_by, body.order_direction, body.extract_folder, body.web_proxy, body.webdav_policy, body.proxy_range, body.down_proxy_url, body.disable_proxy_sign, body.id)
       .run();
     await saveOneDriveToken(env, body.id, parseJson(body.addition));
-    await clearCachePrefix(env, "fs:");
+    await clearStorageCache(env);
     return ok();
   }
   if (path.endsWith("/delete")) {
@@ -492,13 +566,13 @@ async function adminStorage(request, env, path) {
     await db.prepare("DELETE FROM storages WHERE id = ?").bind(id).run();
     await db.prepare("DELETE FROM onedrive_tokens WHERE storage_id = ?").bind(id).run();
     await db.prepare("DELETE FROM search_nodes WHERE storage_id = ?").bind(id).run();
-    await clearCachePrefix(env, "fs:");
+    await clearStorageCache(env);
     return ok();
   }
   if (path.endsWith("/enable") || path.endsWith("/disable")) {
     const disabled = path.endsWith("/disable") ? 1 : 0;
     await db.prepare("UPDATE storages SET disabled = ?, modified = CURRENT_TIMESTAMP WHERE id = ?").bind(disabled, intParam(request, "id")).run();
-    await clearCachePrefix(env, "fs:");
+    await clearStorageCache(env);
     return ok();
   }
   if (path.endsWith("/load_all")) return ok();
@@ -531,10 +605,12 @@ async function adminMeta(request, env, path) {
         .bind(body.path, body.read_users, body.read_users_sub, body.write_users, body.write_users_sub, body.password, body.p_sub, body.write, body.w_sub, body.hide, body.h_sub, body.readme, body.r_sub, body.header, body.header_sub, body.id)
         .run();
     }
+    await clearMetaCache(env);
     return ok();
   }
   if (path.endsWith("/delete")) {
     await db.prepare("DELETE FROM metas WHERE id = ?").bind(intParam(request, "id")).run();
+    await clearMetaCache(env);
     return ok();
   }
   return apiError("api not found", 404);
@@ -718,15 +794,13 @@ async function fsSearch(request, env) {
   const page = pageReq(body, request);
   if (!keyword) return ok({ content: [], total: 0 });
   const like = `%${keyword.replace(/[%_]/g, "\\$&")}%`;
-  const total = await env.OPENLIST_DB.prepare("SELECT COUNT(*) AS count FROM search_nodes WHERE name LIKE ? ESCAPE '\\' AND parent LIKE ?")
-    .bind(like, `${parent === "/" ? "" : parent}%`)
-    .first();
   const rows = await env.OPENLIST_DB.prepare("SELECT * FROM search_nodes WHERE name LIKE ? ESCAPE '\\' AND parent LIKE ? ORDER BY parent, name LIMIT ? OFFSET ?")
-    .bind(like, `${parent === "/" ? "" : parent}%`, page.per_page, page.offset)
+    .bind(like, `${parent === "/" ? "" : parent}%`, page.per_page + 1, page.offset)
     .all();
   const content = [];
+  const hasMore = rows.results.length > page.per_page;
   const settings = await settingsMap(env);
-  for (const row of rows.results) {
+  for (const row of rows.results.slice(0, page.per_page)) {
     const full = joinPath(row.parent, row.name);
     const meta = await nearestMeta(env, full);
     if (await canAccess(user, meta, full, String(body.password || ""))) {
@@ -740,7 +814,7 @@ async function fsSearch(request, env) {
       });
     }
   }
-  return ok({ content, total: total.count || content.length });
+  return ok({ content, total: page.offset + content.length + (hasMore ? 1 : 0) });
 }
 
 async function downloadRouter(request, env, path) {
@@ -772,22 +846,21 @@ async function listPath(env, reqPath) {
   if (samePath(reqPath, storage.mount_path) && virtual.length > 0) {
     return { content: virtual, storage };
   }
-  const cacheKey = `fs:list:${storage.id}:${reqPath}`;
-  const cached = await getCache(env, cacheKey);
+  const cacheKey = fsListCacheKey(storage, reqPath);
+  const cached = await getRuntimeCache(cacheKey);
   if (cached) return { content: cached, storage };
   const items = await oneDriveList(env, storage, reqPath);
   const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
   const cacheSeconds = cacheSecondsForPath(storage, reqPath);
-  if (cacheSeconds > 0) await setCache(env, cacheKey, content, cacheSeconds);
+  if (cacheSeconds > 0) await setRuntimeCache(cacheKey, content, cacheSeconds);
   return { content, storage };
 }
 
 async function virtualListing(env, reqPath) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM storages WHERE disabled = 0 ORDER BY storage_order, mount_path").all();
+  const storages = await enabledStorages(env, "order");
   const names = new Map();
   const prefix = addSlash(reqPath);
-  for (const row of rows.results) {
-    const storage = storageFromRow(row);
+  for (const storage of storages) {
     if (samePath(storage.mount_path, reqPath)) continue;
     if (!storage.mount_path.startsWith(prefix)) continue;
     const rest = storage.mount_path.slice(prefix.length);
@@ -828,15 +901,14 @@ async function getObjAtPath(env, reqPath) {
 
 async function cachedObjFromParentList(env, storage, reqPath) {
   const parent = dirname(reqPath);
-  const cached = await getCache(env, `fs:list:${storage.id}:${parent}`);
+  const cached = await getRuntimeCache(fsListCacheKey(storage, parent));
   if (!Array.isArray(cached)) return null;
   return cached.find((obj) => obj && obj.name === basename(reqPath)) || null;
 }
 
 async function matchedStorage(env, reqPath) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM storages WHERE disabled = 0 ORDER BY LENGTH(mount_path) DESC").all();
-  for (const row of rows.results) {
-    const storage = storageFromRow(row);
+  const storages = await enabledStorages(env, "length");
+  for (const storage of storages) {
     if (samePath(reqPath, storage.mount_path) || reqPath.startsWith(addSlash(storage.mount_path))) return storage;
   }
   return null;
@@ -863,9 +935,14 @@ async function oneDriveGet(env, storage, reqPath) {
 }
 
 async function oneDriveDownloadUrl(env, storage, reqPath) {
-  const cacheKey = `fs:download:${storage.id}:${reqPath}`;
-  const cached = await getCache(env, cacheKey);
-  if (cached) return typeof cached === "string" ? cached : cached.url;
+  const cacheKey = downloadCacheKey(storage, reqPath);
+  const cached = memoryGet(cacheKey);
+  if (cached) return cached;
+  const runtimeCached = await getRuntimeCache(cacheKey);
+  if (runtimeCached) {
+    memorySet(cacheKey, runtimeCached, RUNTIME_MEMORY_TTL);
+    return runtimeCached;
+  }
 
   const cachedObj = await cachedObjFromParentList(env, storage, reqPath);
   if (cachedObj && cachedObj.download_url) {
@@ -901,7 +978,11 @@ function applyCustomDownloadHost(downloadUrl, storage) {
 
 async function cacheDownloadUrl(env, storage, reqPath, downloadUrl) {
   const seconds = Math.min(cacheSecondsForPath(storage, dirname(reqPath)), 3300);
-  if (seconds > 0) await setCache(env, `fs:download:${storage.id}:${reqPath}`, downloadUrl, seconds);
+  if (seconds > 0) {
+    const key = downloadCacheKey(storage, reqPath);
+    memorySet(key, downloadUrl, seconds);
+    await setRuntimeCache(key, downloadUrl, seconds);
+  }
 }
 
 async function oneDrivePagedList(accessToken, url) {
@@ -938,8 +1019,23 @@ async function oneDriveApi(env, storage, forceRefresh = false) {
 }
 
 async function getOneDriveAccessToken(env, storage, addition, forceRefresh = false) {
+  const tokenCacheKey = `onedrive:${storage.id}`;
+  const cachedToken = forceRefresh ? null : memoryGet(tokenCacheKey);
+  if (cachedToken && cachedToken.access_token && Number(cachedToken.expires_at) > nowSeconds() + 120) return cachedToken.access_token;
+  const runtimeToken = forceRefresh ? null : await getRuntimeCache(tokenCacheKey);
+  if (runtimeToken && runtimeToken.access_token && Number(runtimeToken.expires_at) > nowSeconds() + 120) {
+    memorySet(tokenCacheKey, runtimeToken, Math.min(Number(runtimeToken.expires_at) - nowSeconds(), 3300));
+    return runtimeToken.access_token;
+  }
+
   const row = await env.OPENLIST_DB.prepare("SELECT * FROM onedrive_tokens WHERE storage_id = ?").bind(storage.id).first();
-  if (!forceRefresh && row && row.access_token && Number(row.expires_at) > nowSeconds() + 120) return row.access_token;
+  if (!forceRefresh && row && row.access_token && Number(row.expires_at) > nowSeconds() + 120) {
+    const tokenValue = { access_token: row.access_token, expires_at: Number(row.expires_at) };
+    const ttl = Math.min(Number(row.expires_at) - nowSeconds(), 3300);
+    memorySet(tokenCacheKey, tokenValue, ttl);
+    await setRuntimeCache(tokenCacheKey, tokenValue, ttl);
+    return row.access_token;
+  }
   const refreshToken = (row && row.refresh_token) || addition.refresh_token;
   if (!refreshToken) throw new Error("OneDrive refresh_token is required");
   const clientId = addition.client_id || env.ONEDRIVE_CLIENT_ID;
@@ -950,6 +1046,10 @@ async function getOneDriveAccessToken(env, storage, addition, forceRefresh = fal
     await env.OPENLIST_DB.prepare("INSERT INTO onedrive_tokens (storage_id, access_token, refresh_token, expires_at, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(storage_id) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token, expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP")
       .bind(storage.id, data.access_token, data.refresh_token || refreshToken, nowSeconds() + Number(data.expires_in || 3600))
       .run();
+    const tokenValue = { access_token: data.access_token, expires_at: nowSeconds() + Number(data.expires_in || 3600) };
+    const ttl = Math.min(Number(data.expires_in || 3600), 3300);
+    memorySet(tokenCacheKey, tokenValue, ttl);
+    await setRuntimeCache(tokenCacheKey, tokenValue, ttl);
     return data.access_token;
   }
   if (!clientId || !clientSecret) throw new Error("OneDrive client_id and client_secret are required");
@@ -967,6 +1067,10 @@ async function getOneDriveAccessToken(env, storage, addition, forceRefresh = fal
   await env.OPENLIST_DB.prepare("INSERT INTO onedrive_tokens (storage_id, access_token, refresh_token, expires_at, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(storage_id) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token, expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP")
     .bind(storage.id, data.access_token, data.refresh_token || refreshToken, nowSeconds() + Number(data.expires_in || 3600))
     .run();
+  const tokenValue = { access_token: data.access_token, expires_at: nowSeconds() + Number(data.expires_in || 3600) };
+  const ttl = Math.min(Number(data.expires_in || 3600), 3300);
+  memorySet(tokenCacheKey, tokenValue, ttl);
+  await setRuntimeCache(tokenCacheKey, tokenValue, ttl);
   return data.access_token;
 }
 
@@ -1379,8 +1483,23 @@ function isStaticAssetRequest(path) {
   return /\.(?:js|mjs|css|map|png|jpg|jpeg|gif|svg|ico|webp|avif|woff2?|ttf|wasm|json|txt)$/i.test(path);
 }
 
+function isDynamicAssetRoute(path) {
+  return path === "/manifest.json" || path === "/robots.txt" || path === "/favicon.ico";
+}
+
 async function publicSettings(env) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM settings ORDER BY item_index").all();
+  return ok(await publicSettingsMap(env));
+}
+
+async function publicSettingsMap(env) {
+  const cached = memoryGet("settings:public");
+  if (cached !== undefined) return cached;
+  const bundled = await getRuntimeCache("settings:public");
+  if (bundled && typeof bundled === "object" && !Array.isArray(bundled)) {
+    memorySet("settings:public", bundled, SETTINGS_MEMORY_TTL);
+    return bundled;
+  }
+  const rows = await allSettingRows(env);
   const exposedPrivate = new Set([
     "customize_head",
     "customize_body",
@@ -1392,10 +1511,12 @@ async function publicSettings(env) {
     "proxy_ignore_headers",
   ]);
   const data = {};
-  for (const row of rows.results) {
+  for (const row of rows) {
     if (row.flag !== FLAG_PRIVATE || exposedPrivate.has(row.key)) data[row.key] = row.value;
   }
-  return ok(data);
+  await setRuntimeCache("settings:public", data, PUBLIC_CONFIG_TTL);
+  memorySet("settings:public", data, SETTINGS_MEMORY_TTL);
+  return data;
 }
 
 async function manifest(env, request) {
@@ -1486,12 +1607,13 @@ async function saveOneDriveToken(env, storageId, addition) {
   await env.OPENLIST_DB.prepare("INSERT INTO onedrive_tokens (storage_id, refresh_token, access_token, expires_at, updated_at) VALUES (?, ?, '', 0, CURRENT_TIMESTAMP) ON CONFLICT(storage_id) DO UPDATE SET refresh_token = excluded.refresh_token, updated_at = CURRENT_TIMESTAMP")
     .bind(storageId, addition.refresh_token)
     .run();
+  clearMemoryPrefix(`onedrive:${storageId}`);
+  await deleteRuntimeCache(`onedrive:${storageId}`);
 }
 
 async function nearestMeta(env, reqPath) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM metas ORDER BY LENGTH(path) DESC").all();
-  for (const row of rows.results) {
-    const meta = metaFromRow(row);
+  const metas = await allMetas(env);
+  for (const meta of metas) {
     if (samePath(reqPath, meta.path) || reqPath.startsWith(addSlash(meta.path))) return meta;
   }
   return null;
@@ -1681,20 +1803,85 @@ function safeUser(user) {
 }
 
 async function getStorageById(env, id) {
-  const row = await env.OPENLIST_DB.prepare("SELECT * FROM storages WHERE id = ?").bind(id).first();
-  return row ? storageFromRow(row) : null;
+  const storages = await allStorages(env);
+  return storages.find((storage) => Number(storage.id) === Number(id)) || null;
+}
+
+async function allStorages(env) {
+  const cached = memoryGet("storages:all");
+  if (cached !== undefined) return cached;
+  const runtime = await getRuntimeCache("storages:all");
+  if (runtime !== null) {
+    memorySet("storages:all", runtime, PUBLIC_CONFIG_TTL);
+    return runtime;
+  }
+  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM storages ORDER BY storage_order, mount_path").all();
+  const storages = rows.results.map(storageFromRow);
+  memorySet("storages:all", storages, PUBLIC_CONFIG_TTL);
+  await setRuntimeCache("storages:all", storages, PUBLIC_CONFIG_TTL);
+  return storages;
+}
+
+async function enabledStorages(env, sort = "order") {
+  const key = `storages:enabled:${sort}`;
+  const cached = memoryGet(key);
+  if (cached !== undefined) return cached;
+  const storages = (await allStorages(env)).filter((storage) => !storage.disabled);
+  if (sort === "length") {
+    storages.sort((a, b) => b.mount_path.length - a.mount_path.length);
+  } else {
+    storages.sort((a, b) => (a.order - b.order) || a.mount_path.localeCompare(b.mount_path));
+  }
+  memorySet(key, storages, PUBLIC_CONFIG_TTL);
+  return storages;
+}
+
+async function allMetas(env) {
+  const cached = memoryGet("metas:all");
+  if (cached !== undefined) return cached;
+  const runtime = await getRuntimeCache("metas:all");
+  if (runtime !== null) {
+    memorySet("metas:all", runtime, PUBLIC_CONFIG_TTL);
+    return runtime;
+  }
+  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM metas ORDER BY LENGTH(path) DESC").all();
+  const metas = rows.results.map(metaFromRow);
+  memorySet("metas:all", metas, PUBLIC_CONFIG_TTL);
+  await setRuntimeCache("metas:all", metas, PUBLIC_CONFIG_TTL);
+  return metas;
+}
+
+async function allSettingRows(env) {
+  const cached = memoryGet("settings:rows");
+  if (cached !== undefined) return cached;
+  const rows = await env.OPENLIST_DB.prepare("SELECT * FROM settings ORDER BY item_index").all();
+  memorySet("settings:rows", rows.results, SETTINGS_MEMORY_TTL);
+  return rows.results;
 }
 
 async function settingsMap(env) {
-  const rows = await env.OPENLIST_DB.prepare("SELECT key, value FROM settings").all();
+  const cached = memoryGet("settings:map");
+  if (cached !== undefined) return cached;
+  const bundled = await getRuntimeCache("settings:map");
+  if (bundled && typeof bundled === "object" && !Array.isArray(bundled)) {
+    memorySet("settings:map", bundled, SETTINGS_MEMORY_TTL);
+    return bundled;
+  }
+  const rows = await allSettingRows(env);
   const result = {};
-  for (const row of rows.results) result[row.key] = row.value;
+  for (const row of rows) result[row.key] = row.value;
+  await setRuntimeCache("settings:map", result, PUBLIC_CONFIG_TTL);
+  memorySet("settings:map", result, SETTINGS_MEMORY_TTL);
   return result;
 }
 
 async function getSetting(env, key, fallback = "") {
-  const row = await env.OPENLIST_DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
-  return row ? row.value : fallback;
+  if (VOLATILE_SETTING_KEYS.has(key)) {
+    const row = await env.OPENLIST_DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+    return row ? row.value : fallback;
+  }
+  const settings = await settingsMap(env);
+  return settings[key] ?? fallback;
 }
 
 async function setSetting(env, key, value) {
@@ -1702,21 +1889,55 @@ async function setSetting(env, key, value) {
   await env.OPENLIST_DB.prepare("INSERT INTO settings (key, value, help, type, options, group_id, flag, item_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
     .bind(key, String(value), def.help, def.type, def.options, def.group, def.flag, def.index || 0)
     .run();
+  if (!VOLATILE_SETTING_KEYS.has(key)) await clearSettingsCache(env);
 }
 
-async function getCache(env, key) {
-  const row = await env.OPENLIST_DB.prepare("SELECT value FROM cache WHERE key = ? AND expires_at > ?").bind(key, nowSeconds()).first();
-  return row ? parseJson(row.value, null) : null;
+function fsListCacheKey(storage, reqPath) {
+  return `fs:list:${storage.id}:${storage.modified || ""}:${normalizePath(reqPath)}`;
 }
 
-async function setCache(env, key, value, seconds) {
-  await env.OPENLIST_DB.prepare("INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at")
-    .bind(key, JSON.stringify(value), nowSeconds() + seconds)
-    .run();
+function downloadCacheKey(storage, reqPath) {
+  return `download:${storage.id}:${storage.modified || ""}:${normalizePath(reqPath)}`;
 }
 
-async function clearCachePrefix(env, prefix) {
-  await env.OPENLIST_DB.prepare("DELETE FROM cache WHERE key LIKE ?").bind(`${prefix}%`).run();
+async function getRuntimeCache(key) {
+  const memKey = `runtime:${key}`;
+  const cached = memoryGet(memKey);
+  if (cached !== undefined) return cached;
+  if (typeof caches === "undefined" || !caches.default) return null;
+  const request = await runtimeCacheRequest(key);
+  const resp = await caches.default.match(request).catch(() => null);
+  if (!resp || !resp.ok) return null;
+  const data = await resp.json().catch(() => null);
+  if (!data || Number(data.expires_at || 0) <= nowSeconds()) return null;
+  memorySet(memKey, data.value, Math.min(Number(data.expires_at) - nowSeconds(), RUNTIME_MEMORY_TTL));
+  return data.value;
+}
+
+async function setRuntimeCache(key, value, seconds) {
+  if (seconds <= 0) return;
+  memorySet(`runtime:${key}`, value, Math.min(seconds, RUNTIME_MEMORY_TTL));
+  if (typeof caches === "undefined" || !caches.default) return;
+  const request = await runtimeCacheRequest(key);
+  const body = JSON.stringify({ value, expires_at: nowSeconds() + seconds });
+  const response = new Response(body, {
+    headers: {
+      "Cache-Control": `public, max-age=${seconds}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
+  await caches.default.put(request, response).catch(() => {});
+}
+
+async function deleteRuntimeCache(key) {
+  memoryDelete(`runtime:${key}`);
+  if (typeof caches === "undefined" || !caches.default) return;
+  const request = await runtimeCacheRequest(key);
+  await caches.default.delete(request).catch(() => {});
+}
+
+async function runtimeCacheRequest(key) {
+  return new Request(`https://openlist-runtime-cache.local/${await sha256Hex(key)}`, { method: "GET" });
 }
 
 async function pathSign(env, path, ts) {
@@ -1847,6 +2068,76 @@ function htmlResponse(data) {
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
+}
+
+function memoryGet(key) {
+  const item = MEM_CACHE.get(key);
+  if (!item) return undefined;
+  if (item.expires <= Date.now()) {
+    MEM_CACHE.delete(key);
+    return undefined;
+  }
+  return item.value;
+}
+
+function memorySet(key, value, seconds) {
+  if (seconds <= 0) return;
+  MEM_CACHE.set(key, { value, expires: Date.now() + seconds * 1000 });
+}
+
+function memoryDelete(key) {
+  MEM_CACHE.delete(key);
+}
+
+function clearMemoryPrefix(prefix) {
+  for (const key of MEM_CACHE.keys()) {
+    if (!prefix || key.startsWith(prefix)) MEM_CACHE.delete(key);
+  }
+}
+
+function clearSettingsMemory() {
+  clearMemoryPrefix("settings:");
+}
+
+async function clearSettingsCache(env) {
+  clearSettingsMemory();
+  await deleteRuntimeCache("settings:map");
+  await deleteRuntimeCache("settings:public");
+}
+
+function clearStorageMemory() {
+  clearMemoryPrefix("storages:");
+  clearMemoryPrefix("onedrive:");
+  clearMemoryPrefix("download:");
+  clearMemoryPrefix("runtime:storages:");
+  clearMemoryPrefix("runtime:onedrive:");
+  clearMemoryPrefix("runtime:download:");
+}
+
+async function clearStorageCache(env) {
+  clearStorageMemory();
+  await deleteRuntimeCache("storages:all");
+}
+
+function clearMetaMemory() {
+  clearMemoryPrefix("metas:");
+  clearMemoryPrefix("runtime:metas:");
+}
+
+async function clearMetaCache(env) {
+  clearMetaMemory();
+  await deleteRuntimeCache("metas:all");
+}
+
+function clearUserMemory() {
+  clearMemoryPrefix("session:");
+  clearMemoryPrefix("user:");
+  clearMemoryPrefix("runtime:user:");
+}
+
+async function clearUserCache(env) {
+  clearUserMemory();
+  await deleteRuntimeCache("user:guest");
 }
 
 function normalizePath(input) {
