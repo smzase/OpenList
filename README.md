@@ -44,7 +44,7 @@ cloudflare-pages/
 ```
 
 - `dist/index.html`：内置官方 OpenList 前端入口。
-- `dist/_routes.json`：让页面和 API 进入 Pages Functions，`/assets/*`、`/static/*` 等前端资源仍由 Pages 静态层直接服务。
+- `dist/_routes.json`：只让 `/api/*`、`/d/*` 等后端路由进入 Pages Functions，前端页面和静态资源由 Pages 静态层直接服务。
 - `dist/_headers`：给前端静态资源设置长期浏览器缓存。
 - `dist/_redirects`：让前端路由刷新时回到 `index.html`。
 - `functions/[[path]].js`：Pages Functions 后端逻辑。

@@ -7,6 +7,79 @@ import { fileURLToPath } from "node:url";
 const root = dirname(fileURLToPath(import.meta.url));
 const distDir = resolve(root, "dist");
 const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
+const customizeBootstrap = `<script id="openlist-pages-customize">
+  (function () {
+    if (window.__openlistPagesCustomizeObserver) return;
+    window.__openlistPagesCustomizeObserver = true;
+    function appendHtml(target, html) {
+      if (!target || !html) return;
+      var template = document.createElement("template");
+      template.innerHTML = html;
+      var scripts = Array.prototype.slice.call(template.content.querySelectorAll("script")).map(function (oldScript) {
+        var script = document.createElement("script");
+        for (var i = 0; i < oldScript.attributes.length; i++) {
+          var attr = oldScript.attributes[i];
+          script.setAttribute(attr.name, attr.value);
+        }
+        script.text = oldScript.textContent || "";
+        oldScript.parentNode.removeChild(oldScript);
+        return script;
+      });
+      target.appendChild(template.content);
+      scripts.forEach(function (script) {
+        target.appendChild(script);
+      });
+    }
+    function appendBody(html) {
+      if (document.body) appendHtml(document.body, html);
+      else document.addEventListener("DOMContentLoaded", function () { appendHtml(document.body, html); }, { once: true });
+    }
+    function settingsPath(input) {
+      try {
+        var raw = typeof input === "string" ? input : input && input.url;
+        return raw ? new URL(raw, location.href).pathname === "/api/public/settings" : false;
+      } catch (error) {
+        return false;
+      }
+    }
+    function apply(payload) {
+      if (window.__openlistPagesCustomizeApplied) return;
+      var data = payload && payload.data ? payload.data : {};
+      if (!data.customize_head && !data.customize_body) return;
+      window.__openlistPagesCustomizeApplied = true;
+      appendHtml(document.head, data.customize_head);
+      appendBody(data.customize_body);
+    }
+    var nativeFetch = window.fetch;
+    if (nativeFetch) {
+      window.fetch = function (input, init) {
+        var promise = nativeFetch.apply(this, arguments);
+        if (settingsPath(input)) {
+          promise.then(function (res) {
+            if (res && res.ok) res.clone().json().then(apply).catch(function () {});
+          }).catch(function () {});
+        }
+        return promise;
+      };
+    }
+    var nativeOpen = XMLHttpRequest.prototype.open;
+    var nativeSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__openlistPagesSettings = settingsPath(url);
+      return nativeOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      if (this.__openlistPagesSettings) {
+        this.addEventListener("load", function () {
+          try {
+            if (this.status >= 200 && this.status < 300) apply(JSON.parse(this.responseText || "{}"));
+          } catch (error) {}
+        });
+      }
+      return nativeSend.apply(this, arguments);
+    };
+  })();
+</script>`;
 
 const repo = process.env.OPENLIST_FRONTEND_REPO || "OpenListTeam/OpenList-Frontend";
 const version = process.env.OPENLIST_FRONTEND_VERSION || "latest";
@@ -28,8 +101,8 @@ if (process.env.GITHUB_TOKEN) {
 
 const pagesRoutes = {
   version: 1,
-  include: ["/*"],
-  exclude: ["/assets/*", "/images/*", "/static/*", "/streamer/*", "/VERSION"],
+  include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
+  exclude: [],
 };
 
 const pagesHeaders = `/assets/*
@@ -112,6 +185,12 @@ async function patchIndexHtml() {
   const indexPath = resolve(distDir, "index.html");
   let html = await readFile(indexPath, "utf8");
   html = html.replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "");
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) {
+    html = html.replace(marker, `${marker}\n    ${customizeBootstrap.replace(/\n/g, "\n    ")}`);
+  } else {
+    html = html.replace("</head>", `    ${customizeBootstrap.replace(/\n/g, "\n    ")}\n  </head>`);
+  }
   await writeFile(indexPath, html);
 }
 
