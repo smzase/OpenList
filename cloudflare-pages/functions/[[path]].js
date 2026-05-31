@@ -16,6 +16,7 @@ const SETTINGS_MEMORY_TTL = 60;
 const PUBLIC_CONFIG_TTL = 300;
 const RUNTIME_MEMORY_TTL = 300;
 const SESSION_CACHE_SECONDS = 60;
+const LONG_CACHE_SECONDS = 30 * 24 * 3600;
 let initPromise = null;
 let initializedUntil = 0;
 
@@ -575,6 +576,21 @@ async function adminStorage(request, env, path) {
     await clearStorageCache(env);
     return ok();
   }
+  if (path.endsWith("/refresh_cache") || path.endsWith("/clear_cache")) {
+    const body = await readBody(request);
+    const id = Number(body.id || new URL(request.url).searchParams.get("id") || 0);
+    let changed = 0;
+    if (id > 0) {
+      const result = await db.prepare("UPDATE storages SET modified = CURRENT_TIMESTAMP WHERE id = ?").bind(id).run();
+      changed = Number(result.meta?.changes || result.changes || 0);
+      if (!changed) return apiError("storage not found", 404);
+    } else {
+      const result = await db.prepare("UPDATE storages SET modified = CURRENT_TIMESTAMP").run();
+      changed = Number(result.meta?.changes || result.changes || 0);
+    }
+    await clearStorageVersionCache(env);
+    return ok({ refreshed: changed, id: id || null });
+  }
   if (path.endsWith("/load_all")) return ok();
   return apiError("api not found", 404);
 }
@@ -847,12 +863,21 @@ async function listPath(env, reqPath) {
     return { content: virtual, storage };
   }
   const cacheKey = fsListCacheKey(storage, reqPath);
-  const cached = await getRuntimeCache(cacheKey);
-  if (cached) return { content: cached, storage };
+  const cacheSeconds = cacheSecondsForPath(storage, reqPath);
+  if (cacheSeconds > 0) {
+    const cached = await getRuntimeCache(cacheKey);
+    const cachedContent = fsListContent(cached);
+    if (cachedContent && await isOneDriveListCacheFresh(env, storage, reqPath, cached, cacheSeconds)) {
+      return { content: cachedContent, storage };
+    }
+  }
+  const tag = cacheSeconds > 0 ? await oneDriveFolderTag(env, storage, reqPath).catch(() => "") : "";
   const items = await oneDriveList(env, storage, reqPath);
   const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
-  const cacheSeconds = cacheSecondsForPath(storage, reqPath);
-  if (cacheSeconds > 0) await setRuntimeCache(cacheKey, content, cacheSeconds);
+  if (cacheSeconds > 0) {
+    await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
+    if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
+  }
   return { content, storage };
 }
 
@@ -901,7 +926,7 @@ async function getObjAtPath(env, reqPath) {
 
 async function cachedObjFromParentList(env, storage, reqPath) {
   const parent = dirname(reqPath);
-  const cached = await getRuntimeCache(fsListCacheKey(storage, parent));
+  const cached = fsListContent(await getRuntimeCache(fsListCacheKey(storage, parent)));
   if (!Array.isArray(cached)) return null;
   return cached.find((obj) => obj && obj.name === basename(reqPath)) || null;
 }
@@ -932,6 +957,17 @@ async function oneDriveGet(env, storage, reqPath) {
     return graphJson(freshApi.accessToken, freshApi.itemUrl(reqPath));
   });
   return oneDriveObj(data, true);
+}
+
+async function oneDriveFolderTag(env, storage, reqPath) {
+  const api = await oneDriveApi(env, storage);
+  const url = `${api.itemUrl(reqPath)}?$select=id,eTag,cTag,lastModifiedDateTime,size,folder,fileSystemInfo`;
+  const data = await graphJson(api.accessToken, url).catch(async (error) => {
+    if (error.graphCode !== "InvalidAuthenticationToken") throw error;
+    const freshApi = await oneDriveApi(env, storage, true);
+    return graphJson(freshApi.accessToken, `${freshApi.itemUrl(reqPath)}?$select=id,eTag,cTag,lastModifiedDateTime,size,folder,fileSystemInfo`);
+  });
+  return driveItemTag(data);
 }
 
 async function oneDriveDownloadUrl(env, storage, reqPath) {
@@ -1152,11 +1188,16 @@ async function buildIndex(env) {
 async function frontend(request, env) {
   const settings = await settingsMap(env, true);
   const cdn = (env.OPENLIST_WEB_CDN || "").replace(/\/$/, "");
+  const cacheKey = await frontendHtmlCacheKey(env, settings, cdn);
+  const cached = await getRuntimeCache(cacheKey);
+  if (cached) return htmlResponse(cached);
   if (cdn) {
     const resp = await fetch(`${cdn}/index.html`, { headers: { Accept: "text/html" } }).catch(() => null);
     if (resp && resp.ok) {
       const html = await resp.text();
-      return htmlResponse(injectHtml(html, settings, cdn));
+      const out = injectHtml(html, settings, cdn);
+      await setRuntimeCache(cacheKey, out, LONG_CACHE_SECONDS);
+      return htmlResponse(out);
     }
   }
   if (env.ASSETS) {
@@ -1166,11 +1207,15 @@ async function frontend(request, env) {
     const resp = await env.ASSETS.fetch(new Request(assetUrl.toString(), request));
     if (resp.ok) {
       const html = await resp.text();
-      return htmlResponse(injectHtml(html, settings, ""));
+      const out = injectHtml(html, settings, "");
+      await setRuntimeCache(cacheKey, out, LONG_CACHE_SECONDS);
+      return htmlResponse(out);
     }
   }
   const title = settings.site_title || "OpenList";
-  return htmlResponse(builtinFrontendHtml(settings, title));
+  const out = builtinFrontendHtml(settings, title);
+  await setRuntimeCache(cacheKey, out, LONG_CACHE_SECONDS);
+  return htmlResponse(out);
 }
 
 function builtinFrontendHtml(settings, title) {
@@ -1253,7 +1298,7 @@ ${settings.customize_head || ""}
 
 <section id="tab-storages" class="card hidden">
   <h2>OneDrive Storages</h2>
-  <div class="row"><button id="storage-new">New</button><button id="storage-load">Refresh</button></div>
+  <div class="row"><button id="storage-new">New</button><button id="storage-load">Refresh</button><button id="storage-refresh-cache">Refresh cache</button></div>
   <div id="storage-list"></div>
   <h3 id="storage-form-title">Create Storage</h3>
   <input id="storage-id" type="hidden">
@@ -1401,10 +1446,12 @@ function storagePayload(){
 function resetStorage(){["storage-id","st-client-id","st-client-secret","st-refresh","st-site","st-host"].forEach(function(id){byId(id).value=""}); byId("st-mount").value="/drive"; byId("st-root").value="/"; byId("st-region").value="global"; byId("st-cache").value="30"; byId("st-disabled").checked=false; byId("st-sign").checked=false; byId("storage-form-title").textContent="Create Storage"}
 byId("storage-new").onclick=resetStorage;
 byId("storage-load").onclick=loadStorages;
+byId("storage-refresh-cache").onclick=async function(){try{await admin("/api/admin/storage/refresh_cache",{}); show("Storage cache refreshed"); loadStorages()}catch(e){show(e.message)}};
 byId("storage-save").onclick=async function(){try{var p=storagePayload(); await admin("/api/admin/storage/" + (p.id ? "update" : "create"), p); show("Storage saved"); resetStorage(); loadStorages()}catch(e){show(e.message)}};
 async function loadStorages(){
-  try{var data=await admin("/api/admin/storage/list",{page:1,per_page:100}); byId("storage-list").innerHTML='<table class="table"><tr><th>ID</th><th>Mount</th><th>Status</th><th>Action</th></tr>'+data.content.map(function(s){return '<tr><td>'+s.id+'</td><td>'+esc(s.mount_path)+'</td><td>'+esc(s.disabled?"disabled":s.status)+'</td><td><button data-edit="'+s.id+'">Edit</button> <button data-toggle="'+s.id+'" data-disabled="'+s.disabled+'">'+(s.disabled?"Enable":"Disable")+'</button> <button data-del="'+s.id+'">Delete</button></td></tr>'}).join("")+'</table>';
+  try{var data=await admin("/api/admin/storage/list",{page:1,per_page:100}); byId("storage-list").innerHTML='<table class="table"><tr><th>ID</th><th>Mount</th><th>Status</th><th>Action</th></tr>'+data.content.map(function(s){return '<tr><td>'+s.id+'</td><td>'+esc(s.mount_path)+'</td><td>'+esc(s.disabled?"disabled":s.status)+'</td><td><button data-edit="'+s.id+'">Edit</button> <button data-cache="'+s.id+'">Refresh cache</button> <button data-toggle="'+s.id+'" data-disabled="'+s.disabled+'">'+(s.disabled?"Enable":"Disable")+'</button> <button data-del="'+s.id+'">Delete</button></td></tr>'}).join("")+'</table>';
     byId("storage-list").querySelectorAll("[data-edit]").forEach(function(b){b.onclick=async function(){editStorage(b.dataset.edit)}});
+    byId("storage-list").querySelectorAll("[data-cache]").forEach(function(b){b.onclick=async function(){await admin("/api/admin/storage/refresh_cache?id="+b.dataset.cache,{},"GET"); show("Storage cache refreshed"); loadStorages()}});
     byId("storage-list").querySelectorAll("[data-toggle]").forEach(function(b){b.onclick=async function(){await admin("/api/admin/storage/"+(b.dataset.disabled==="true"?"enable":"disable")+"?id="+b.dataset.toggle,{},"GET"); loadStorages()}});
     byId("storage-list").querySelectorAll("[data-del]").forEach(function(b){b.onclick=async function(){if(confirm("Delete storage?")){await admin("/api/admin/storage/delete?id="+b.dataset.del,{},"GET"); loadStorages()}}});
   }catch(e){show(e.message)}
@@ -1467,8 +1514,84 @@ function injectHtml(html, settings, cdn) {
     .replace("https://res.oplist.org/logo/logo.svg", settings.favicon || "https://res.oplist.org/logo/logo.svg")
     .replace("https://res.oplist.org/logo/logo.png", (settings.logo || "").split("\n")[0] || "https://res.oplist.org/logo/logo.svg");
   out = out.replace("</head>", `${settings.customize_head || ""}</head>`);
-  out = out.replace("</body>", `${settings.customize_body || ""}</body>`);
+  out = out.replace("</body>", `${storageCacheRefreshScript()}${settings.customize_body || ""}</body>`);
   return out;
+}
+
+async function frontendHtmlCacheKey(env, settings, cdn) {
+  const version = env.OPENLIST_FRONTEND_CACHE_VERSION || env.CF_PAGES_COMMIT_SHA || env.CF_PAGES_DEPLOYMENT_ID || "default";
+  const data = {
+    version,
+    cdn,
+    site_title: settings.site_title || "",
+    favicon: settings.favicon || "",
+    logo: settings.logo || "",
+    main_color: settings.main_color || "",
+    customize_head: settings.customize_head || "",
+    customize_body: settings.customize_body || "",
+  };
+  return `frontend:html:${await sha256Hex(JSON.stringify(data))}`;
+}
+
+function storageCacheRefreshScript() {
+  return `<script data-openlist-storage-cache-refresh>
+(function(){
+  if (window.__openlistStorageCacheRefresh) return;
+  window.__openlistStorageCacheRefresh = true;
+  var button = null;
+  function inStoragePage() {
+    return /\\/(?:@|%40)manage\\/storages(?:\\/|$)/.test(location.pathname) || location.hash.indexOf("@manage/storages") >= 0;
+  }
+  function authToken() {
+    return localStorage.getItem("token") || localStorage.getItem("openlist_token") || localStorage.getItem("alist_token") || "";
+  }
+  function ensureButton() {
+    if (!inStoragePage()) {
+      if (button) button.hidden = true;
+      return;
+    }
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Refresh cache";
+      button.title = "Force refresh OneDrive cache";
+      button.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:2147483647;border:0;border-radius:8px;padding:10px 14px;background:#2563eb;color:#fff;font:600 14px system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 8px 24px rgba(15,23,42,.22);cursor:pointer";
+      button.onclick = async function() {
+        if (!confirm("Refresh all OneDrive cache now?")) return;
+        var token = authToken();
+        if (!token) {
+          alert("Please login first.");
+          return;
+        }
+        button.disabled = true;
+        button.textContent = "Refreshing...";
+        try {
+          var resp = await fetch("/api/admin/storage/refresh_cache", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: token },
+            body: "{}"
+          });
+          var data = await resp.json().catch(function(){ return {}; });
+          if (!resp.ok || data.code !== 200) throw new Error(data.message || "Refresh failed");
+          button.textContent = "Cache refreshed";
+          setTimeout(function(){ button.textContent = "Refresh cache"; button.disabled = false; }, 1500);
+        } catch (error) {
+          alert(error && error.message ? error.message : "Refresh failed");
+          button.textContent = "Refresh cache";
+          button.disabled = false;
+        }
+      };
+      document.body.appendChild(button);
+    }
+    button.hidden = false;
+  }
+  window.addEventListener("popstate", ensureButton);
+  window.addEventListener("hashchange", ensureButton);
+  new MutationObserver(ensureButton).observe(document.documentElement, { childList: true, subtree: true });
+  setInterval(ensureButton, 1000);
+  ensureButton();
+})();
+</script>`;
 }
 
 function isStaticAssetRequest(path) {
@@ -1577,6 +1700,16 @@ function oneDriveObj(item, includeDownloadUrl = false) {
   };
   if (includeDownloadUrl) obj.download_url = item["@microsoft.graph.downloadUrl"] || item.content?.downloadUrl || "";
   return obj;
+}
+
+function driveItemTag(item) {
+  const info = item.fileSystemInfo || {};
+  return [
+    item.cTag || "",
+    item.eTag || "",
+    info.lastModifiedDateTime || item.lastModifiedDateTime || "",
+    String(item.size ?? ""),
+  ].join("|");
 }
 
 function oneDrivePath(storage, addition, reqPath) {
@@ -1896,6 +2029,36 @@ function fsListCacheKey(storage, reqPath) {
   return `fs:list:${storage.id}:${storage.modified || ""}:${normalizePath(reqPath)}`;
 }
 
+function fsListFreshKey(storage, reqPath) {
+  return `fs:fresh:${storage.id}:${storage.modified || ""}:${normalizePath(reqPath)}`;
+}
+
+function fsListContent(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.content)) return payload.content;
+  return null;
+}
+
+async function isOneDriveListCacheFresh(env, storage, reqPath, payload, seconds) {
+  const tag = payload && !Array.isArray(payload) ? String(payload.tag || "") : "";
+  if (!tag) return false;
+  const freshKey = fsListFreshKey(storage, reqPath);
+  const trusted = await getRuntimeCache(freshKey);
+  if (trusted === tag) return true;
+  let current = "";
+  try {
+    current = await oneDriveFolderTag(env, storage, reqPath);
+  } catch (error) {
+    const code = String(error && error.graphCode || "").toLowerCase();
+    if (code.includes("notfound") || code.includes("not_found")) return false;
+    return true;
+  }
+  if (!current) return false;
+  if (current !== tag) return false;
+  await setRuntimeCache(freshKey, tag, seconds);
+  return true;
+}
+
 function downloadCacheKey(storage, reqPath) {
   return `download:${storage.id}:${storage.modified || ""}:${normalizePath(reqPath)}`;
 }
@@ -2116,6 +2279,15 @@ function clearStorageMemory() {
 
 async function clearStorageCache(env) {
   clearStorageMemory();
+  await deleteRuntimeCache("storages:all");
+}
+
+async function clearStorageVersionCache(env) {
+  clearMemoryPrefix("storages:");
+  clearMemoryPrefix("download:");
+  clearMemoryPrefix("runtime:storages:");
+  clearMemoryPrefix("runtime:download:");
+  clearMemoryPrefix("runtime:fs:");
   await deleteRuntimeCache("storages:all");
 }
 
