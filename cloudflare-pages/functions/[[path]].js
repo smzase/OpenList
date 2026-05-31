@@ -20,6 +20,7 @@ const LONG_CACHE_SECONDS = 30 * 24 * 3600;
 const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v2";
 let initPromise = null;
 let initializedUntil = 0;
+let runtimeCacheNamespace = "default";
 
 const GROUPS = {
   SINGLE: 0,
@@ -154,6 +155,7 @@ const ONEDRIVE_DRIVER_INFO = {
 export async function onRequest(context) {
   const { request, env } = context;
   try {
+    runtimeCacheNamespace = runtimeCacheNamespaceFromEnv(env);
     const url = new URL(request.url);
     const path = normalizePath(url.pathname);
 
@@ -2104,7 +2106,16 @@ async function deleteRuntimeCache(key) {
 }
 
 async function runtimeCacheRequest(key) {
-  return new Request(`https://openlist-runtime-cache.local/${await sha256Hex(key)}`, { method: "GET" });
+  return new Request(`https://openlist-runtime-cache.local/${await sha256Hex(`${runtimeCacheNamespace}:${key}`)}`, { method: "GET" });
+}
+
+function runtimeCacheNamespaceFromEnv(env) {
+  return String(
+    env.OPENLIST_CACHE_VERSION ||
+    env.CF_PAGES_COMMIT_SHA ||
+    env.CF_PAGES_DEPLOYMENT_ID ||
+    "default"
+  );
 }
 
 async function pathSign(env, path, ts) {
