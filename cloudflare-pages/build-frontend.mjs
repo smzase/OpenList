@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 const root = dirname(fileURLToPath(import.meta.url));
 const distDir = resolve(root, "dist");
 const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
+const preloadStart = "<!-- openlist pages preloads -->";
+const preloadEnd = "<!-- /openlist pages preloads -->";
 const customizeBootstrap = `<script id="openlist-pages-customize">
   (function () {
     if (window.__openlistPagesCustomizeObserver) return;
@@ -184,6 +186,7 @@ async function downloadAndExtract(url) {
 async function patchIndexHtml() {
   const indexPath = resolve(distDir, "index.html");
   let html = await readFile(indexPath, "utf8");
+  html = await injectPreloadLinks(html);
   html = html.replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "");
   const marker = "<!-- customize head -->";
   if (html.includes(marker)) {
@@ -192,6 +195,63 @@ async function patchIndexHtml() {
     html = html.replace("</head>", `    ${customizeBootstrap.replace(/\n/g, "\n    ")}\n  </head>`);
   }
   await writeFile(indexPath, html);
+}
+
+async function injectPreloadLinks(html) {
+  html = html.replace(new RegExp(`\\s*${escapeRegExp(preloadStart)}[\\s\\S]*?${escapeRegExp(preloadEnd)}\\s*`, "i"), "\n");
+  const preloads = await collectPreloadLinks(html);
+  if (preloads.length === 0) return html;
+  const block = [
+    preloadStart,
+    ...preloads.map((href) => {
+      if (href.endsWith(".css")) return `    <link rel="preload" as="style" crossorigin href="${href}" >`;
+      return `    <link rel="modulepreload" crossorigin href="${href}" >`;
+    }),
+    `    ${preloadEnd}`,
+  ].join("\n");
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
+  return html.replace("</head>", `    ${block}\n  </head>`);
+}
+
+async function collectPreloadLinks(html) {
+  const links = new Set();
+  const add = (href) => {
+    if (href && href.startsWith("/assets/") && !href.includes("-legacy-")) links.add(href);
+  };
+
+  for (const match of html.matchAll(/(?:src|href|data-src)=["'](\/assets\/index-[^"']+\.(?:js|css))["']/g)) {
+    add(match[1]);
+  }
+
+  const mainJs = [...links].find((href) => /^\/assets\/index-[^/]+\.js$/.test(href));
+  if (mainJs) {
+    const source = await readFile(resolve(distDir, mainJs.slice(1)), "utf8").catch(() => "");
+    const depsMatch = source.match(/m\.f\|\|\(m\.f=(\[[^\]]+\])\)/);
+    if (depsMatch) {
+      try {
+        const deps = JSON.parse(depsMatch[1]);
+        for (const dep of deps) {
+          const name = dep.split("/").pop() || "";
+          if (/^(manage|setting|test|Upload)-/.test(name)) break;
+          add(`/${dep}`);
+        }
+      } catch (error) {
+        console.warn(`Could not parse frontend dependency preload list: ${error.message}`);
+      }
+    }
+  }
+
+  const assetNames = await readdir(resolve(distDir, "assets")).catch(() => []);
+  for (const name of assetNames) {
+    if (/^entry-(?!legacy-)[A-Za-z0-9_-]+\.js$/.test(name)) add(`/assets/${name}`);
+  }
+
+  return [...links];
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function streamToFile(stream, path) {

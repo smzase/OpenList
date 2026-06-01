@@ -18,6 +18,7 @@ const PUBLIC_CONFIG_TTL = 300;
 const RUNTIME_MEMORY_TTL = 300;
 const SESSION_CACHE_SECONDS = 60;
 const LONG_CACHE_SECONDS = 30 * 24 * 3600;
+const DIRECTORY_REVALIDATE_LOCK_SECONDS = 60;
 const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v3";
 let initPromise = null;
 let initializedUntil = 0;
@@ -191,8 +192,12 @@ export async function onRequest(context) {
 
 async function apiRouter(request, env, path, context) {
   if (path === "/api/public/settings") return publicSettings(env);
-  if (path === "/api/public/offline_download_tools") return ok([], { "Cache-Control": "public, max-age=86400" });
-  if (path === "/api/public/archive_extensions") return ok([], { "Cache-Control": "public, max-age=86400" });
+  if (path === "/api/public/offline_download_tools") {
+    return ok([], publicApiDebugHeaders("static", nowMilliseconds(), { "Cache-Control": "public, max-age=86400" }));
+  }
+  if (path === "/api/public/archive_extensions") {
+    return ok([], publicApiDebugHeaders("static", nowMilliseconds(), { "Cache-Control": "public, max-age=86400" }));
+  }
   if (path === "/api/auth/login" || path === "/api/auth/login/hash") return login(request, env, path.endsWith("/hash"));
   if (path === "/api/auth/login/ldap") return apiError("LDAP login is not supported in Cloudflare Pages mode", 400);
   if (path === "/api/auth/sso") return apiError("SSO login is not supported in Cloudflare Pages mode", 400);
@@ -743,6 +748,7 @@ function adminCompat(path) {
 }
 
 async function fsList(request, env, context) {
+  const startedAt = nowMilliseconds();
   const user = await getRequestUser(request, env, false);
   if (!user) return apiError("Guest user is disabled, login please", 401);
   const body = await readBody(request);
@@ -753,7 +759,7 @@ async function fsList(request, env, context) {
   if (!(await canAccess(user, meta, reqPath, password))) return apiError("password is incorrect or you have no permission", 403);
   let listing;
   try {
-    listing = await listPath(env, reqPath);
+    listing = await listPath(env, reqPath, context, { refresh: truthy(body.refresh) });
   } catch (error) {
     return apiError(`Failed to list ${reqPath}: ${error && error.message ? error.message : String(error)}`, 500);
   }
@@ -772,7 +778,7 @@ async function fsList(request, env, context) {
     write_content_bypass: false,
     provider: listing.storage ? "Onedrive" : "unknown",
     direct_upload_tools: [],
-  });
+  }, fsDebugHeaders(listing, startedAt));
 }
 
 async function fsGet(request, env) {
@@ -878,50 +884,94 @@ async function downloadRouter(request, env, path) {
   }
 }
 
-async function listPath(env, reqPath) {
+async function listPath(env, reqPath, context = null, options = {}) {
   const virtual = await virtualListing(env, reqPath);
   const storage = await matchedStorage(env, reqPath);
-  if (!storage) return { content: virtual, storage: null };
+  if (!storage) return { content: virtual, storage: null, cache: "virtual", revalidate: "none" };
   if (samePath(reqPath, storage.mount_path) && virtual.length > 0) {
-    return { content: virtual, storage };
+    return { content: virtual, storage, cache: "virtual", revalidate: "none" };
   }
   const cacheKey = fsListCacheKey(storage, reqPath);
   const cacheSeconds = cacheSecondsForPath(storage, reqPath);
-  if (cacheSeconds > 0) {
+  const refresh = truthy(options.refresh);
+  if (cacheSeconds > 0 && !refresh) {
     const cached = await getRuntimeCache(cacheKey);
     const cachedContent = fsListContent(cached);
-    if (cachedContent && await isOneDriveListCacheFresh(env, storage, reqPath, cached, cacheSeconds)) {
-      return { content: cachedContent, storage };
+    if (cachedContent) {
+      if (await isOneDriveListCacheTrusted(env, storage, reqPath, cached)) {
+        return { content: cachedContent, storage, cache: "hit", revalidate: "fresh" };
+      }
+      const revalidate = scheduleListRevalidate(context, env, storage, reqPath, virtual, cacheKey, cacheSeconds, cached);
+      return { content: cachedContent, storage, cache: "stale", revalidate };
     }
   }
-  const load = async () => {
-    let tag = "";
-    let items = [];
-    if (cacheSeconds > 0) {
-      [tag, items] = await Promise.all([
-        oneDriveFolderTag(env, storage, reqPath).catch(() => ""),
-        oneDriveList(env, storage, reqPath),
-      ]);
-    } else {
-      items = await oneDriveList(env, storage, reqPath);
-    }
-    const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
-    if (cacheSeconds > 0) {
-      await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
-      if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
-    }
-    return content;
-  };
   if (cacheSeconds > 0) {
     let inflight = INFLIGHT_LISTS.get(cacheKey);
     if (!inflight) {
-      inflight = load().finally(() => INFLIGHT_LISTS.delete(cacheKey));
+      inflight = loadListPathContent(env, storage, reqPath, virtual, cacheKey, cacheSeconds)
+        .finally(() => INFLIGHT_LISTS.delete(cacheKey));
       INFLIGHT_LISTS.set(cacheKey, inflight);
     }
-    return { content: await inflight, storage };
+    return { content: await inflight, storage, cache: refresh ? "refresh" : "miss", revalidate: "sync" };
   }
-  const content = await load();
-  return { content, storage };
+  const content = await loadListPathContent(env, storage, reqPath, virtual, cacheKey, cacheSeconds);
+  return { content, storage, cache: "bypass", revalidate: "none" };
+}
+
+async function loadListPathContent(env, storage, reqPath, virtual, cacheKey, cacheSeconds) {
+  let tag = "";
+  let items = [];
+  if (cacheSeconds > 0) {
+    [tag, items] = await Promise.all([
+      oneDriveFolderTag(env, storage, reqPath).catch(() => ""),
+      oneDriveList(env, storage, reqPath),
+    ]);
+  } else {
+    items = await oneDriveList(env, storage, reqPath);
+  }
+  const content = mergeListContent(items, virtual);
+  if (cacheSeconds > 0) {
+    await cacheListPathContent(env, storage, reqPath, cacheKey, cacheSeconds, tag, content);
+  }
+  return content;
+}
+
+function mergeListContent(items, virtual) {
+  return [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
+}
+
+async function cacheListPathContent(env, storage, reqPath, cacheKey, cacheSeconds, tag, content) {
+  await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
+  if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
+}
+
+function scheduleListRevalidate(context, env, storage, reqPath, virtual, cacheKey, cacheSeconds, cached) {
+  if (!context || typeof context.waitUntil !== "function") return "none";
+  const lockKey = `revalidate:${cacheKey}`;
+  if (memoryGet(lockKey)) return "inflight";
+  memorySet(lockKey, true, DIRECTORY_REVALIDATE_LOCK_SECONDS);
+  context.waitUntil(revalidateListCache(env, storage, reqPath, virtual, cacheKey, cacheSeconds, cached)
+    .finally(() => memoryDelete(lockKey))
+    .catch(() => {}));
+  return "scheduled";
+}
+
+async function revalidateListCache(env, storage, reqPath, virtual, cacheKey, cacheSeconds, cached) {
+  const oldTag = fsListTag(cached);
+  let currentTag = "";
+  try {
+    currentTag = await oneDriveFolderTag(env, storage, reqPath);
+  } catch (error) {
+    const code = String(error && error.graphCode || "").toLowerCase();
+    if (code.includes("notfound") || code.includes("not_found")) await deleteRuntimeCache(cacheKey);
+    return;
+  }
+  if (oldTag && currentTag && currentTag === oldTag) {
+    await setRuntimeCache(fsListFreshKey(storage, reqPath), currentTag, cacheSeconds);
+    return;
+  }
+  const items = await oneDriveList(env, storage, reqPath);
+  await cacheListPathContent(env, storage, reqPath, cacheKey, cacheSeconds, currentTag, mergeListContent(items, virtual));
 }
 
 function scheduleDirectoryPreheat(context, env, reqPath, requestedPath, listing, sorted, body) {
@@ -1695,16 +1745,22 @@ function isDynamicAssetRoute(path) {
 }
 
 async function publicSettings(env) {
-  return ok(await publicSettingsMap(env));
+  const startedAt = nowMilliseconds();
+  const trace = { cache: "unknown" };
+  return ok(await publicSettingsMap(env, trace), publicApiDebugHeaders(trace.cache, startedAt));
 }
 
-async function publicSettingsMap(env) {
+async function publicSettingsMap(env, trace = null) {
   const cacheKey = `settings:public:${BUILTIN_ADMIN_SCRIPT_VERSION}`;
   const cached = memoryGet("settings:public");
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    if (trace) trace.cache = "memory";
+    return cached;
+  }
   const bundled = await getRuntimeCache(cacheKey);
   if (bundled && typeof bundled === "object" && !Array.isArray(bundled)) {
     memorySet("settings:public", bundled, SETTINGS_MEMORY_TTL);
+    if (trace) trace.cache = "runtime";
     return bundled;
   }
   const rows = await allSettingRows(env);
@@ -1725,6 +1781,7 @@ async function publicSettingsMap(env) {
   data.customize_body = `${storageCacheRefreshScript()}${data.customize_body || ""}`;
   await setRuntimeCache(cacheKey, data, PUBLIC_CONFIG_TTL);
   memorySet("settings:public", data, SETTINGS_MEMORY_TTL);
+  if (trace) trace.cache = "d1";
   return data;
 }
 
@@ -2141,24 +2198,17 @@ function fsListContent(payload) {
   return null;
 }
 
-async function isOneDriveListCacheFresh(env, storage, reqPath, payload, seconds) {
+function fsListTag(payload) {
+  return payload && !Array.isArray(payload) ? String(payload.tag || "") : "";
+}
+
+async function isOneDriveListCacheTrusted(env, storage, reqPath, payload) {
   const tag = payload && !Array.isArray(payload) ? String(payload.tag || "") : "";
   if (!tag) return false;
   const freshKey = fsListFreshKey(storage, reqPath);
   const trusted = await getRuntimeCache(freshKey);
   if (trusted === tag) return true;
-  let current = "";
-  try {
-    current = await oneDriveFolderTag(env, storage, reqPath);
-  } catch (error) {
-    const code = String(error && error.graphCode || "").toLowerCase();
-    if (code.includes("notfound") || code.includes("not_found")) return false;
-    return true;
-  }
-  if (!current) return false;
-  if (current !== tag) return false;
-  await setRuntimeCache(freshKey, tag, seconds);
-  return true;
+  return false;
 }
 
 function downloadCacheKey(storage, reqPath) {
@@ -2340,8 +2390,34 @@ function htmlResponse(data) {
   return new Response(data, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
+function fsDebugHeaders(listing, startedAt) {
+  return debugHeaders(startedAt, {
+    "X-OpenList-FS-Cache": listing.cache || "unknown",
+    "X-OpenList-FS-Revalidate": listing.revalidate || "none",
+    "X-OpenList-Storage": listing.storage ? String(listing.storage.id) : "virtual",
+  });
+}
+
+function publicApiDebugHeaders(cacheState, startedAt, headers = {}) {
+  return debugHeaders(startedAt, {
+    ...headers,
+    "X-OpenList-Cache": cacheState || "unknown",
+  });
+}
+
+function debugHeaders(startedAt, headers = {}) {
+  return {
+    ...headers,
+    "Server-Timing": `openlist;dur=${Math.max(0, nowMilliseconds() - startedAt)}`,
+  };
+}
+
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
+}
+
+function nowMilliseconds() {
+  return Date.now();
 }
 
 function memoryGet(key) {
