@@ -15,7 +15,20 @@
           var entries = {"en":"/assets/entry-DRSLtp6R.js","zh-cn":"/assets/entry-CaUXegOj.js","zh-tw":"/assets/entry-BozmW67Y.js"};
           var saved = "";
           try { saved = localStorage.getItem("lang") || ""; } catch (error) {}
-          var lang = String(saved || navigator.language || "en").toLowerCase();
+          function normalizeLang(value) {
+            var raw = String(value || "en");
+            var lower = raw.toLowerCase();
+            if (lower === "zh-cn" || lower === "zh-hans" || lower === "zh-sg") return { storage: "zh-CN", key: "zh-cn" };
+            if (lower === "zh-tw" || lower === "zh-hk" || lower === "zh-mo" || lower === "zh-hant") return { storage: "zh-TW", key: "zh-tw" };
+            if (lower.indexOf("zh") === 0) return /tw|hk|mo|hant/.test(lower) ? { storage: "zh-TW", key: "zh-tw" } : { storage: "zh-CN", key: "zh-cn" };
+            if (lower.indexOf("en") === 0) return { storage: "en", key: "en" };
+            return { storage: saved || "", key: lower };
+          }
+          var normalized = normalizeLang(saved || navigator.language || "en");
+          if (normalized.storage && normalized.storage !== saved) {
+            try { localStorage.setItem("lang", normalized.storage); } catch (error) {}
+          }
+          var lang = normalized.key;
           var key = entries[lang] ? lang : lang.split("-")[0];
           if (lang.indexOf("zh") === 0 && !entries[key]) key = /tw|hk|mo|hant/.test(lang) ? "zh-tw" : "zh-cn";
           var href = entries[key] || entries.en;

@@ -130,6 +130,16 @@ const pagesHeaders = `/assets/*
 `;
 
 async function main() {
+  if (process.env.OPENLIST_PATCH_ONLY === "1") {
+    await patchIndexHtml();
+    await patchFrontendBundles();
+    await writeFile(resolve(distDir, "_routes.json"), JSON.stringify(pagesRoutes, null, 2) + "\n");
+    await writeFile(resolve(distDir, "_headers"), pagesHeaders);
+    await writeFile(resolve(distDir, "_redirects"), "/* /index.html 200\n");
+    console.log("OpenList frontend patches have been applied to existing cloudflare-pages/dist");
+    return;
+  }
+
   console.log(`Downloading OpenList frontend directly: ${directUrl}`);
   if (await downloadAndExtract(directUrl)) {
     return;
@@ -190,16 +200,30 @@ async function downloadAndExtract(url) {
 async function patchIndexHtml() {
   const indexPath = resolve(distDir, "index.html");
   let html = await readFile(indexPath, "utf8");
+  let replacedCustomize = false;
+  html = html.replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>/i, () => {
+    replacedCustomize = true;
+    return customizeBootstrap.replace(/\n/g, "\n    ");
+  });
   html = await injectPreloadLinks(html);
   html = await injectLanguagePreloadScript(html);
-  html = html.replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "");
-  const marker = "<!-- customize head -->";
-  if (html.includes(marker)) {
-    html = html.replace(marker, `${marker}\n    ${customizeBootstrap.replace(/\n/g, "\n    ")}`);
-  } else {
-    html = html.replace("</head>", `    ${customizeBootstrap.replace(/\n/g, "\n    ")}\n  </head>`);
-  }
+  if (!replacedCustomize) html = injectCustomizeBootstrap(html);
+  html = html
+    .replace(/\n<meta charset=/i, "\n    <meta charset=")
+    .replace(/\n\s*\n    <meta charset=/i, "\n    <meta charset=");
   await writeFile(indexPath, html);
+}
+
+function injectCustomizeBootstrap(html) {
+  const marker = "<!-- customize head -->";
+  const block = customizeBootstrap.replace(/\n/g, "\n    ");
+  if (/<script\s+type=["']module["']>/i.test(html)) {
+    return html.replace(/(\n\s*<script\s+type=["']module["'][^>]*>)/i, `\n    ${block}$1`);
+  }
+  if (html.includes(marker)) {
+    return html.replace(marker, `${marker}\n    ${block}`);
+  }
+  return html.replace("</head>", `    ${block}\n  </head>`);
 }
 
 async function injectLanguagePreloadScript(html) {
@@ -214,7 +238,20 @@ async function injectLanguagePreloadScript(html) {
     `          var entries = ${JSON.stringify(entries)};`,
     `          var saved = "";`,
     `          try { saved = localStorage.getItem("lang") || ""; } catch (error) {}`,
-    `          var lang = String(saved || navigator.language || "en").toLowerCase();`,
+    `          function normalizeLang(value) {`,
+    `            var raw = String(value || "en");`,
+    `            var lower = raw.toLowerCase();`,
+    `            if (lower === "zh-cn" || lower === "zh-hans" || lower === "zh-sg") return { storage: "zh-CN", key: "zh-cn" };`,
+    `            if (lower === "zh-tw" || lower === "zh-hk" || lower === "zh-mo" || lower === "zh-hant") return { storage: "zh-TW", key: "zh-tw" };`,
+    `            if (lower.indexOf("zh") === 0) return /tw|hk|mo|hant/.test(lower) ? { storage: "zh-TW", key: "zh-tw" } : { storage: "zh-CN", key: "zh-cn" };`,
+    `            if (lower.indexOf("en") === 0) return { storage: "en", key: "en" };`,
+    `            return { storage: saved || "", key: lower };`,
+    `          }`,
+    `          var normalized = normalizeLang(saved || navigator.language || "en");`,
+    `          if (normalized.storage && normalized.storage !== saved) {`,
+    `            try { localStorage.setItem("lang", normalized.storage); } catch (error) {}`,
+    `          }`,
+    `          var lang = normalized.key;`,
     `          var key = entries[lang] ? lang : lang.split("-")[0];`,
     `          if (lang.indexOf("zh") === 0 && !entries[key]) key = /tw|hk|mo|hant/.test(lang) ? "zh-tw" : "zh-cn";`,
     `          var href = entries[key] || entries.en;`,
@@ -229,14 +266,15 @@ async function injectLanguagePreloadScript(html) {
     `    </script>`,
     `    ${langPreloadEnd}`,
   ].join("\n");
-  if (html.includes(preloadEnd)) return html.replace(preloadEnd, `${preloadEnd}\n    ${block}`);
+  if (html.includes(preloadEnd)) return html.replace(preloadEnd, `${preloadEnd}\n    ${block}\n    `);
   const marker = "<!-- customize head -->";
-  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
-  return html.replace("</head>", `    ${block}\n  </head>`);
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}\n    `);
+  return html.replace("</head>", `    ${block}\n    </head>`);
 }
 
 async function injectPreloadLinks(html) {
   html = html.replace(new RegExp(`\\s*${escapeRegExp(preloadStart)}[\\s\\S]*?${escapeRegExp(preloadEnd)}\\s*`, "i"), "\n");
+  html = html.replace(new RegExp(`\\s*${escapeRegExp(settingsPreload)}\\s*`, "i"), "\n");
   const preloads = await collectPreloadLinks(html);
   if (preloads.length === 0) return injectSettingsPreload(html);
   const block = [
@@ -267,6 +305,9 @@ async function collectPreloadLinks(html) {
   };
 
   for (const match of html.matchAll(/(?:src|href|data-src)=["'](\/assets\/index-[^"']+\.(?:js|css))["']/g)) {
+    add(match[1]);
+  }
+  for (const match of html.matchAll(/["'](?:src|href|data-src)["']\s*:\s*["'](\/assets\/index-[^"']+\.(?:js|css))["']/g)) {
     add(match[1]);
   }
 
@@ -321,14 +362,23 @@ async function patchFrontendBundles() {
       /\b[A-Za-z_$][\w$]*\.get\(([`"'])\/public\/(?:archive_extensions|offline_download_tools)\1\)/g,
       'Promise.resolve({code:200,message:"success",data:[]})',
     ).replace(
-      /\b([A-Za-z_$][\w$]*)\.get\(([`"'])\/public\/settings\2\)/g,
+      /(?<!:)\b([A-Za-z_$][\w$]*)\.get\(([`"'])\/public\/settings\2\)/g,
       '(window.__openlistPagesPublicSettings?Promise.resolve({code:200,message:"success",data:window.__openlistPagesTakePublicSettings()}):$1.get("/public/settings"))',
     );
-    if (next === source) continue;
-    await writeFile(filePath, next);
+    const nextWithLanguageFallback = patchLanguageDictionaryFallback(next);
+    if (nextWithLanguageFallback === source) continue;
+    await writeFile(filePath, nextWithLanguageFallback);
     patched += 1;
   }
-  if (patched > 0) console.log(`Patched ${patched} frontend bundle(s) to inline fixed public API responses`);
+  if (patched > 0) console.log(`Patched ${patched} frontend bundle(s) for Pages compatibility`);
+}
+
+function patchLanguageDictionaryFallback(source) {
+  const pattern =
+    /var ([A-Za-z_$][\w$]*)=async ([A-Za-z_$][\w$]*)=>\{try\{let ([A-Za-z_$][\w$]*)=\(await ([A-Za-z_$][\w$]*)\(Object\.assign\((\{[\s\S]*?"\.\.\/lang\/zh-TW\/entry\.ts"[\s\S]*?\})\),`\.\.\/lang\/\$\{\2\}\/entry\.ts`,4\)\)\.dict;return ([A-Za-z_$][\w$]*)\(\3\)\}catch\(([A-Za-z_$][\w$]*)\)\{throw console\.error\(`Error loading dictionary for locale: \$\{\2\}`,\7\),Error\(`Failed to load dictionary for \$\{\2\}`\)\}\}/;
+  return source.replace(pattern, (_match, loader, locale, dict, importMap, modules, transform) => {
+    return `var ${loader}=async ${locale}=>{let n=String(${locale}||\`en\`),r=[n,n.toLowerCase().startsWith(\`zh\`)?(/tw|hk|mo|hant/i.test(n)?\`zh-TW\`:\`zh-CN\`):\`en\`,\`en\`].filter((e,t,n)=>e&&n.indexOf(e)===t);for(let i of r)try{let ${dict}=(await ${importMap}(Object.assign(${modules}),\`../lang/\${i}/entry.ts\`,4)).dict;return ${transform}(${dict})}catch(a){console.error(\`Error loading dictionary for locale: \`+i,a)}throw Error(\`Failed to load dictionary for \`+${locale})}`;
+  });
 }
 
 async function streamToFile(stream, path) {
