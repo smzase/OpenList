@@ -234,18 +234,15 @@ async function collectPreloadLinks(html) {
         const deps = JSON.parse(depsMatch[1]);
         for (const dep of deps) {
           const name = dep.split("/").pop() || "";
-          if (/^(manage|setting|test|Upload)-/.test(name)) break;
-          add(`/${dep}`);
+          if (/^Layout-/.test(name)) {
+            add(`/${dep}`);
+            break;
+          }
         }
       } catch (error) {
         console.warn(`Could not parse frontend dependency preload list: ${error.message}`);
       }
     }
-  }
-
-  const assetNames = await readdir(resolve(distDir, "assets")).catch(() => []);
-  for (const name of assetNames) {
-    if (/^entry-(?!legacy-)[A-Za-z0-9_-]+\.js$/.test(name)) add(`/assets/${name}`);
   }
 
   return [...links];
@@ -266,6 +263,9 @@ async function patchFrontendBundles() {
     const next = source.replace(
       /\b[A-Za-z_$][\w$]*\.get\(([`"'])\/public\/(?:archive_extensions|offline_download_tools)\1\)/g,
       'Promise.resolve({code:200,message:"success",data:[]})',
+    ).replace(
+      /\b([A-Za-z_$][\w$]*)\.get\(([`"'])\/public\/settings\2\)/g,
+      '(window.__openlistPagesPublicSettings?Promise.resolve({code:200,message:"success",data:window.__openlistPagesTakePublicSettings()}):$1.get("/public/settings"))',
     );
     if (next === source) continue;
     await writeFile(filePath, next);

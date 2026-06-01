@@ -1639,8 +1639,10 @@ load();
 
 function injectHtml(html, settings, cdn) {
   const manifestPath = "/manifest.json";
+  const publicSettingsScript = inlinePublicSettingsScript(settings);
   let out = html
     .replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "")
+    .replace(/<script\b[^>]*id=["']openlist-pages-public-settings["'][\s\S]*?<\/script>\s*/i, "")
     .replace("cdn: undefined", `cdn: '${cdn}'`)
     .replace("base_path: undefined", "base_path: '/'")
     .replace("main_color: undefined", `main_color: '${settings.main_color || "#1890ff"}'`)
@@ -1648,7 +1650,7 @@ function injectHtml(html, settings, cdn) {
     .replace("Loading...", escapeHtml(settings.site_title || "OpenList"))
     .replace("https://res.oplist.org/logo/logo.svg", settings.favicon || "https://res.oplist.org/logo/logo.svg")
     .replace("https://res.oplist.org/logo/logo.png", (settings.logo || "").split("\n")[0] || "https://res.oplist.org/logo/logo.svg");
-  out = out.replace("</head>", `${settings.customize_head || ""}</head>`);
+  out = out.replace("</head>", `${publicSettingsScript}${settings.customize_head || ""}</head>`);
   out = out.replace("</body>", `${storageCacheRefreshScript()}${settings.customize_body || ""}</body>`);
   return out;
 }
@@ -1665,6 +1667,7 @@ async function frontendHtmlCacheKey(env, settings, cdn) {
     main_color: settings.main_color || "",
     customize_head: settings.customize_head || "",
     customize_body: settings.customize_body || "",
+    public_settings: publicSettingsFromMap(settings),
   };
   return `frontend:html:${await sha256Hex(JSON.stringify(data))}`;
 }
@@ -1779,7 +1782,14 @@ async function publicSettingsMap(env, trace = null) {
     if (trace) trace.cache = "runtime";
     return bundled;
   }
-  const rows = await allSettingRows(env);
+  const data = publicSettingsFromMap(await settingsMap(env));
+  await setRuntimeCache(cacheKey, data, PUBLIC_CONFIG_TTL);
+  memorySet("settings:public", data, SETTINGS_MEMORY_TTL);
+  if (trace) trace.cache = "d1";
+  return data;
+}
+
+function publicSettingsFromMap(settings) {
   const exposedPrivate = new Set([
     "customize_head",
     "customize_body",
@@ -1791,14 +1801,25 @@ async function publicSettingsMap(env, trace = null) {
     "proxy_ignore_headers",
   ]);
   const data = {};
-  for (const row of rows) {
-    if (row.flag !== FLAG_PRIVATE || exposedPrivate.has(row.key)) data[row.key] = row.value;
+  for (const item of DEFAULT_SETTINGS) {
+    if (item.flag !== FLAG_PRIVATE || exposedPrivate.has(item.key)) data[item.key] = settings[item.key] ?? item.value;
   }
   data.customize_body = `${storageCacheRefreshScript()}${data.customize_body || ""}`;
-  await setRuntimeCache(cacheKey, data, PUBLIC_CONFIG_TTL);
-  memorySet("settings:public", data, SETTINGS_MEMORY_TTL);
-  if (trace) trace.cache = "d1";
   return data;
+}
+
+function inlinePublicSettingsScript(settings) {
+  return `<script id="openlist-pages-public-settings">window.__openlistPagesPublicSettings=${scriptJson(publicSettingsFromMap(settings))};window.__openlistPagesTakePublicSettings=function(){var data=window.__openlistPagesPublicSettings;window.__openlistPagesPublicSettings=undefined;return data;};</script>`;
+}
+
+function scriptJson(value) {
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (char) => {
+    if (char === "<") return "\\u003c";
+    if (char === ">") return "\\u003e";
+    if (char === "&") return "\\u0026";
+    if (char === "\u2028") return "\\u2028";
+    return "\\u2029";
+  });
 }
 
 async function manifest(env, request) {
