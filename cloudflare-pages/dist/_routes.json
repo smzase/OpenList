@@ -1,6 +1,10 @@
 {
   "version": 1,
   "include": [
+    "/",
+    "/index.html",
+    "/@*",
+    "/%40*",
     "/api/*",
     "/d/*",
     "/ping",

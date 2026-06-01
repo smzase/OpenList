@@ -794,6 +794,7 @@ async function fsList(request, env, context) {
 }
 
 async function fsGet(request, env) {
+  const startedAt = nowMilliseconds();
   const user = await getRequestUser(request, env, false);
   if (!user) return apiError("Guest user is disabled, login please", 401);
   const body = await readBody(request);
@@ -821,7 +822,7 @@ async function fsGet(request, env) {
     header: metaText(meta, reqPath, "header", "header_sub"),
     provider: "Onedrive",
     related: await Promise.all(relatedList.map((obj) => objResp(env, obj, parent, found.storage, settings))),
-  });
+  }, debugHeaders(startedAt));
 }
 
 async function fsDirs(request, env) {

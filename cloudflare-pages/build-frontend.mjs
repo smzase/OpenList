@@ -9,6 +9,8 @@ const distDir = resolve(root, "dist");
 const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
 const preloadStart = "<!-- openlist pages preloads -->";
 const preloadEnd = "<!-- /openlist pages preloads -->";
+const langPreloadStart = "<!-- openlist pages language preload -->";
+const langPreloadEnd = "<!-- /openlist pages language preload -->";
 const customizeBootstrap = `<script id="openlist-pages-customize">
   (function () {
     if (window.__openlistPagesCustomizeObserver) return;
@@ -103,7 +105,7 @@ if (process.env.GITHUB_TOKEN) {
 
 const pagesRoutes = {
   version: 1,
-  include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
+  include: ["/", "/index.html", "/@*", "/%40*", "/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
   exclude: [],
 };
 
@@ -188,6 +190,7 @@ async function patchIndexHtml() {
   const indexPath = resolve(distDir, "index.html");
   let html = await readFile(indexPath, "utf8");
   html = await injectPreloadLinks(html);
+  html = await injectLanguagePreloadScript(html);
   html = html.replace(/<script\b[^>]*id=["']openlist-pages-customize["'][\s\S]*?<\/script>\s*/i, "");
   const marker = "<!-- customize head -->";
   if (html.includes(marker)) {
@@ -196,6 +199,39 @@ async function patchIndexHtml() {
     html = html.replace("</head>", `    ${customizeBootstrap.replace(/\n/g, "\n    ")}\n  </head>`);
   }
   await writeFile(indexPath, html);
+}
+
+async function injectLanguagePreloadScript(html) {
+  html = html.replace(new RegExp(`\\s*${escapeRegExp(langPreloadStart)}[\\s\\S]*?${escapeRegExp(langPreloadEnd)}\\s*`, "i"), "\n");
+  const entries = await collectLanguageEntryMap();
+  if (Object.keys(entries).length === 0) return html;
+  const block = [
+    langPreloadStart,
+    `    <script id="openlist-pages-language-preload">`,
+    `      (function(){`,
+    `        try {`,
+    `          var entries = ${JSON.stringify(entries)};`,
+    `          var saved = "";`,
+    `          try { saved = localStorage.getItem("lang") || ""; } catch (error) {}`,
+    `          var lang = String(saved || navigator.language || "en").toLowerCase();`,
+    `          var key = entries[lang] ? lang : lang.split("-")[0];`,
+    `          if (lang.indexOf("zh") === 0 && !entries[key]) key = /tw|hk|mo|hant/.test(lang) ? "zh-tw" : "zh-cn";`,
+    `          var href = entries[key] || entries.en;`,
+    `          if (!href) return;`,
+    `          var link = document.createElement("link");`,
+    `          link.rel = "modulepreload";`,
+    `          link.crossOrigin = "";`,
+    `          link.href = href;`,
+    `          document.head.appendChild(link);`,
+    `        } catch (error) {}`,
+    `      })();`,
+    `    </script>`,
+    `    ${langPreloadEnd}`,
+  ].join("\n");
+  if (html.includes(preloadEnd)) return html.replace(preloadEnd, `${preloadEnd}\n    ${block}`);
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
+  return html.replace("</head>", `    ${block}\n  </head>`);
 }
 
 async function injectPreloadLinks(html) {
@@ -246,6 +282,18 @@ async function collectPreloadLinks(html) {
   }
 
   return [...links];
+}
+
+async function collectLanguageEntryMap() {
+  const assetNames = await readdir(resolve(distDir, "assets")).catch(() => []);
+  const mainJs = assetNames.find((name) => /^index-(?!legacy-)[A-Za-z0-9_-]+\.js$/.test(name));
+  if (!mainJs) return {};
+  const source = await readFile(resolve(distDir, "assets", mainJs), "utf8").catch(() => "");
+  const entries = {};
+  for (const match of source.matchAll(/"\.\.\/lang\/([^/]+)\/entry\.ts":\(\)=>[^`]*import\(`\.\/(entry-[^`]+\.js)`\)/g)) {
+    entries[match[1].toLowerCase()] = `/assets/${match[2]}`;
+  }
+  return entries;
 }
 
 function escapeRegExp(value) {

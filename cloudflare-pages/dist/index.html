@@ -7,6 +7,27 @@
     <link rel="preload" as="style" crossorigin href="/assets/index-Bpb1jTBr.css" >
     <link rel="modulepreload" crossorigin href="/assets/Layout-A5t8lWBA.js" >
     <!-- /openlist pages preloads -->
+    <!-- openlist pages language preload -->
+    <script id="openlist-pages-language-preload">
+      (function(){
+        try {
+          var entries = {"en":"/assets/entry-DRSLtp6R.js","zh-cn":"/assets/entry-CaUXegOj.js","zh-tw":"/assets/entry-BozmW67Y.js"};
+          var saved = "";
+          try { saved = localStorage.getItem("lang") || ""; } catch (error) {}
+          var lang = String(saved || navigator.language || "en").toLowerCase();
+          var key = entries[lang] ? lang : lang.split("-")[0];
+          if (lang.indexOf("zh") === 0 && !entries[key]) key = /tw|hk|mo|hant/.test(lang) ? "zh-tw" : "zh-cn";
+          var href = entries[key] || entries.en;
+          if (!href) return;
+          var link = document.createElement("link");
+          link.rel = "modulepreload";
+          link.crossOrigin = "";
+          link.href = href;
+          document.head.appendChild(link);
+        } catch (error) {}
+      })();
+    </script>
+    <!-- /openlist pages language preload -->
     <meta charset="utf-8" >
     <meta name="viewport" content="width=device-width, initial-scale=1" >
     <meta name="referrer" content="same-origin" >
