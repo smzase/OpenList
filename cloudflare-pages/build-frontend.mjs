@@ -176,6 +176,7 @@ async function downloadAndExtract(url) {
 
   await rm(tmpTar, { force: true });
   await patchIndexHtml();
+  await patchFrontendBundles();
   await writeFile(resolve(distDir, "_routes.json"), JSON.stringify(pagesRoutes, null, 2) + "\n");
   await writeFile(resolve(distDir, "_headers"), pagesHeaders);
   await writeFile(resolve(distDir, "_redirects"), "/* /index.html 200\n");
@@ -252,6 +253,25 @@ async function collectPreloadLinks(html) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function patchFrontendBundles() {
+  const assetsDir = resolve(distDir, "assets");
+  const files = await readdir(assetsDir).catch(() => []);
+  let patched = 0;
+  for (const file of files) {
+    if (!file.endsWith(".js")) continue;
+    const filePath = resolve(assetsDir, file);
+    const source = await readFile(filePath, "utf8");
+    const next = source.replace(
+      /\b[A-Za-z_$][\w$]*\.get\(([`"'])\/public\/(?:archive_extensions|offline_download_tools)\1\)/g,
+      'Promise.resolve({code:200,message:"success",data:[]})',
+    );
+    if (next === source) continue;
+    await writeFile(filePath, next);
+    patched += 1;
+  }
+  if (patched > 0) console.log(`Patched ${patched} frontend bundle(s) to inline fixed public API responses`);
 }
 
 async function streamToFile(stream, path) {

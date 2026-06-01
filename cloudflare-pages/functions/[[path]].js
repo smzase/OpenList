@@ -20,6 +20,18 @@ const SESSION_CACHE_SECONDS = 60;
 const LONG_CACHE_SECONDS = 30 * 24 * 3600;
 const DIRECTORY_REVALIDATE_LOCK_SECONDS = 60;
 const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v3";
+const ONEDRIVE_LIST_SELECT = [
+  "id",
+  "name",
+  "size",
+  "folder",
+  "file",
+  "fileSystemInfo",
+  "createdDateTime",
+  "lastModifiedDateTime",
+  "cTag",
+  "eTag",
+].join(",");
 let initPromise = null;
 let initializedUntil = 0;
 let runtimeCacheNamespace = "default";
@@ -1059,12 +1071,16 @@ async function matchedStorage(env, reqPath) {
 
 async function oneDriveList(env, storage, reqPath) {
   const api = await oneDriveApi(env, storage);
-  const url = `${api.childrenUrl(reqPath)}?$top=1000`;
+  const url = oneDriveChildrenListUrl(api, reqPath);
   return oneDrivePagedList(api.accessToken, url).catch(async (error) => {
     if (error.graphCode !== "InvalidAuthenticationToken") throw error;
     const freshApi = await oneDriveApi(env, storage, true);
-    return oneDrivePagedList(freshApi.accessToken, `${freshApi.childrenUrl(reqPath)}?$top=1000`);
+    return oneDrivePagedList(freshApi.accessToken, oneDriveChildrenListUrl(freshApi, reqPath));
   });
+}
+
+function oneDriveChildrenListUrl(api, reqPath) {
+  return `${api.childrenUrl(reqPath)}?$top=1000&$select=${encodeURIComponent(ONEDRIVE_LIST_SELECT)}`;
 }
 
 async function oneDriveGet(env, storage, reqPath) {
