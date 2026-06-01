@@ -9,6 +9,7 @@ const distDir = resolve(root, "dist");
 const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
 const preloadStart = "<!-- openlist pages preloads -->";
 const preloadEnd = "<!-- /openlist pages preloads -->";
+const settingsPreload = `<link rel="preload" as="fetch" crossorigin href="/api/public/settings">`;
 const langPreloadStart = "<!-- openlist pages language preload -->";
 const langPreloadEnd = "<!-- /openlist pages language preload -->";
 const customizeBootstrap = `<script id="openlist-pages-customize">
@@ -237,9 +238,10 @@ async function injectLanguagePreloadScript(html) {
 async function injectPreloadLinks(html) {
   html = html.replace(new RegExp(`\\s*${escapeRegExp(preloadStart)}[\\s\\S]*?${escapeRegExp(preloadEnd)}\\s*`, "i"), "\n");
   const preloads = await collectPreloadLinks(html);
-  if (preloads.length === 0) return html;
+  if (preloads.length === 0) return injectSettingsPreload(html);
   const block = [
     preloadStart,
+    `    ${settingsPreload}`,
     ...preloads.map((href) => {
       if (href.endsWith(".css")) return `    <link rel="preload" as="style" crossorigin href="${href}" >`;
       return `    <link rel="modulepreload" crossorigin href="${href}" >`;
@@ -249,6 +251,13 @@ async function injectPreloadLinks(html) {
   const marker = "<!-- customize head -->";
   if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
   return html.replace("</head>", `    ${block}\n  </head>`);
+}
+
+function injectSettingsPreload(html) {
+  if (html.includes(settingsPreload)) return html;
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${settingsPreload}`);
+  return html.replace("</head>", `    ${settingsPreload}\n  </head>`);
 }
 
 async function collectPreloadLinks(html) {
