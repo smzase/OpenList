@@ -11,6 +11,7 @@ const WORK_STATUS = "work";
 
 const DEFAULT_WEB_CDN = "https://res.oplist.org";
 const MEM_CACHE = new Map();
+const INFLIGHT_LISTS = new Map();
 const VOLATILE_SETTING_KEYS = new Set(["index_progress", "scan_progress"]);
 const SETTINGS_MEMORY_TTL = 60;
 const PUBLIC_CONFIG_TTL = 300;
@@ -893,21 +894,33 @@ async function listPath(env, reqPath) {
       return { content: cachedContent, storage };
     }
   }
-  let tag = "";
-  let items = [];
+  const load = async () => {
+    let tag = "";
+    let items = [];
+    if (cacheSeconds > 0) {
+      [tag, items] = await Promise.all([
+        oneDriveFolderTag(env, storage, reqPath).catch(() => ""),
+        oneDriveList(env, storage, reqPath),
+      ]);
+    } else {
+      items = await oneDriveList(env, storage, reqPath);
+    }
+    const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
+    if (cacheSeconds > 0) {
+      await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
+      if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
+    }
+    return content;
+  };
   if (cacheSeconds > 0) {
-    [tag, items] = await Promise.all([
-      oneDriveFolderTag(env, storage, reqPath).catch(() => ""),
-      oneDriveList(env, storage, reqPath),
-    ]);
-  } else {
-    items = await oneDriveList(env, storage, reqPath);
+    let inflight = INFLIGHT_LISTS.get(cacheKey);
+    if (!inflight) {
+      inflight = load().finally(() => INFLIGHT_LISTS.delete(cacheKey));
+      INFLIGHT_LISTS.set(cacheKey, inflight);
+    }
+    return { content: await inflight, storage };
   }
-  const content = [...items, ...virtual.filter((v) => !items.some((i) => i.name === v.name))];
-  if (cacheSeconds > 0) {
-    await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
-    if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
-  }
+  const content = await load();
   return { content, storage };
 }
 
