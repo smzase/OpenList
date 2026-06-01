@@ -85,6 +85,8 @@ const DEFAULT_SETTINGS = [
   item("customize_body", "", "text", GROUPS.GLOBAL, FLAG_PRIVATE),
   item("link_expiration", "0", "number", GROUPS.GLOBAL, FLAG_PRIVATE),
   item("sign_all", "true", "bool", GROUPS.GLOBAL, FLAG_PRIVATE),
+  item("preheat_directories", "true", "bool", GROUPS.GLOBAL, FLAG_PRIVATE),
+  item("preheat_directory_limit", "3", "number", GROUPS.GLOBAL, FLAG_PRIVATE),
   item("privacy_regs", "(?:(?:\\d|[1-9]\\d|1\\d\\d|2[0-4]\\d|25[0-5])\\.){3}(?:\\d|[1-9]\\d|1\\d\\d|2[0-4]\\d|25[0-5])", "text", GROUPS.GLOBAL, FLAG_PRIVATE),
   item("ocr_api", "https://openlistteam-ocr-api-server.hf.space/ocr/file/json", "string", GROUPS.GLOBAL),
   item("filename_char_mapping", "{\"/\":\"|\"}", "text", GROUPS.GLOBAL),
@@ -175,7 +177,7 @@ export async function onRequest(context) {
     }
     if (path === "/ping") return text("pong");
     if (path === "/manifest.json") return manifest(env, request);
-    if (path.startsWith("/api/")) return apiRouter(request, env, path);
+    if (path.startsWith("/api/")) return apiRouter(request, env, path, context);
     if (path === "/robots.txt") return robots(env);
     if (path === "/favicon.ico") return favicon(env);
     if (path.startsWith("/d/")) return downloadRouter(request, env, path);
@@ -186,7 +188,7 @@ export async function onRequest(context) {
   }
 }
 
-async function apiRouter(request, env, path) {
+async function apiRouter(request, env, path, context) {
   if (path === "/api/public/settings") return publicSettings(env);
   if (path === "/api/public/offline_download_tools") return ok([], { "Cache-Control": "public, max-age=86400" });
   if (path === "/api/public/archive_extensions") return ok([], { "Cache-Control": "public, max-age=86400" });
@@ -204,7 +206,7 @@ async function apiRouter(request, env, path) {
   if (path === "/api/me/sshkey/list") return requireLogin(request, env, () => ok({ content: [], total: 0 }));
   if (path === "/api/me/sshkey/add") return requireLogin(request, env, () => apiError("SSH keys are not supported in Cloudflare Pages mode", 400));
   if (path === "/api/me/sshkey/delete") return requireLogin(request, env, () => ok());
-  if (path === "/api/fs/list") return fsList(request, env);
+  if (path === "/api/fs/list") return fsList(request, env, context);
   if (path === "/api/fs/get") return fsGet(request, env);
   if (path === "/api/fs/dirs") return fsDirs(request, env);
   if (path === "/api/fs/search") return fsSearch(request, env);
@@ -475,7 +477,13 @@ async function adminSetting(request, env, path) {
     } else {
       rows = await db.prepare("SELECT * FROM settings ORDER BY item_index").all();
     }
-    return ok(rows.results.map(settingFromRow));
+    const saved = rows.results.map(settingFromRow);
+    const savedKeys = new Set(saved.map((row) => row.key));
+    const defaults = DEFAULT_SETTINGS
+      .map(settingFromDefault)
+      .filter((row) => !savedKeys.has(row.key))
+      .filter((row) => groups.length === 0 || groups.includes(row.group));
+    return ok([...saved, ...defaults].sort((a, b) => (a.index - b.index) || a.key.localeCompare(b.key)));
   }
   if (path.endsWith("/get")) {
     const url = new URL(request.url);
@@ -483,13 +491,22 @@ async function adminSetting(request, env, path) {
     const keys = (url.searchParams.get("keys") || "").split(",").filter(Boolean);
     if (key) {
       const row = await db.prepare("SELECT * FROM settings WHERE key = ?").bind(key).first();
-      if (!row) return apiError("setting not found", 404);
+      if (!row) {
+        const def = DEFAULT_SETTINGS.find((item) => item.key === key);
+        if (def) return ok(settingFromDefault(def, DEFAULT_SETTINGS.indexOf(def)));
+        return apiError("setting not found", 404);
+      }
       return ok(settingFromRow(row));
     }
     if (keys.length === 0) return ok([]);
     const placeholders = keys.map(() => "?").join(",");
     const rows = await db.prepare(`SELECT * FROM settings WHERE key IN (${placeholders}) ORDER BY item_index`).bind(...keys).all();
-    return ok(rows.results.map(settingFromRow));
+    const saved = rows.results.map(settingFromRow);
+    const savedKeys = new Set(saved.map((row) => row.key));
+    const defaults = DEFAULT_SETTINGS
+      .map(settingFromDefault)
+      .filter((row) => keys.includes(row.key) && !savedKeys.has(row.key));
+    return ok([...saved, ...defaults].sort((a, b) => (a.index - b.index) || a.key.localeCompare(b.key)));
   }
   if (path.endsWith("/save")) {
     const body = await readBody(request);
@@ -724,11 +741,12 @@ function adminCompat(path) {
   return ok();
 }
 
-async function fsList(request, env) {
+async function fsList(request, env, context) {
   const user = await getRequestUser(request, env, false);
   if (!user) return apiError("Guest user is disabled, login please", 401);
   const body = await readBody(request);
-  const reqPath = joinBasePath(user.base_path, body.path || new URL(request.url).searchParams.get("path") || "/");
+  const requestedPath = body.path || new URL(request.url).searchParams.get("path") || "/";
+  const reqPath = joinBasePath(user.base_path, requestedPath);
   const password = String(body.password || "");
   const meta = await nearestMeta(env, reqPath);
   if (!(await canAccess(user, meta, reqPath, password))) return apiError("password is incorrect or you have no permission", 403);
@@ -743,6 +761,7 @@ async function fsList(request, env) {
   const page = pageReq(body, request);
   const sliced = sorted.slice(page.offset, page.offset + page.per_page);
   const settings = await settingsMap(env);
+  scheduleDirectoryPreheat(context, env, reqPath, requestedPath, listing, sorted, body);
   return ok({
     content: await Promise.all(sliced.map((obj) => objResp(env, obj, reqPath, listing.storage, settings))),
     total: sorted.length,
@@ -890,6 +909,31 @@ async function listPath(env, reqPath) {
     if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
   }
   return { content, storage };
+}
+
+function scheduleDirectoryPreheat(context, env, reqPath, requestedPath, listing, sorted, body) {
+  if (!context || typeof context.waitUntil !== "function") return;
+  if (!listing || !listing.storage || !Array.isArray(sorted)) return;
+  if (normalizePath(requestedPath || "/") === "/" || truthy(body.refresh)) return;
+  const dirs = sorted.filter((obj) => obj && obj.is_dir && !obj.virtual);
+  if (dirs.length === 0) return;
+  context.waitUntil(preheatChildDirectories(env, listing.storage, reqPath, dirs).catch(() => {}));
+}
+
+async function preheatChildDirectories(env, storage, parentPath, dirs) {
+  if (!boolSetting(await getSetting(env, "preheat_directories", "true"))) return;
+  const limit = Math.min(20, Math.max(0, Number(await getSetting(env, "preheat_directory_limit", "3")) || 0));
+  if (limit <= 0) return;
+  const selected = dirs.slice(0, limit);
+  await Promise.allSettled(selected.map(async (obj) => {
+    const childPath = joinPath(parentPath, obj.name);
+    const lockKey = `preheat:${storage.id}:${storage.modified || ""}:${childPath}`;
+    if (memoryGet(lockKey)) return;
+    memorySet(lockKey, true, 60);
+    const cached = fsListContent(await getRuntimeCache(fsListCacheKey(storage, childPath)));
+    if (cached) return;
+    await listPath(env, childPath);
+  }));
 }
 
 async function virtualListing(env, reqPath) {
@@ -1946,6 +1990,19 @@ function settingFromRow(row) {
   };
 }
 
+function settingFromDefault(item, index) {
+  return {
+    key: item.key,
+    value: item.value,
+    help: item.help,
+    type: item.type,
+    options: item.options,
+    group: item.group,
+    flag: item.flag,
+    index,
+  };
+}
+
 function safeUser(user) {
   return {
     id: user.id,
@@ -2032,6 +2089,9 @@ async function settingsMap(env) {
   const rows = await allSettingRows(env);
   const result = {};
   for (const row of rows) result[row.key] = row.value;
+  for (const item of DEFAULT_SETTINGS) {
+    if (result[item.key] === undefined) result[item.key] = item.value;
+  }
   await setRuntimeCache("settings:map", result, PUBLIC_CONFIG_TTL);
   memorySet("settings:map", result, SETTINGS_MEMORY_TTL);
   return result;

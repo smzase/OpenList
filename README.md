@@ -137,6 +137,14 @@ cloudflare-pages/
 
 下载时 Pages Functions 会向 Microsoft Graph 获取 OneDrive 的临时下载链接，然后返回 `302 Location`，不会代理文件内容。
 
+## 目录预热
+
+进入某个非根目录后，Pages Functions 会在后台预热该目录下少量子目录的一层列表，减少下一次点进子目录时的等待。
+
+- `preheat_directories`：是否启用目录预热，默认 `true`。
+- `preheat_directory_limit`：每次最多预热多少个子目录，默认 `3`。
+- 访问前台根目录 `/` 时不会触发目录预热，避免首页扫全盘。
+
 ## 索引说明
 
 Pages 版索引使用 D1 的 `search_nodes` 表实现，适合中小目录。
