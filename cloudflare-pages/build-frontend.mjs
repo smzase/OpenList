@@ -12,6 +12,25 @@ const preloadEnd = "<!-- /openlist pages preloads -->";
 const settingsPreload = `<link rel="preload" as="fetch" crossorigin href="/api/public/settings">`;
 const langPreloadStart = "<!-- openlist pages language preload -->";
 const langPreloadEnd = "<!-- /openlist pages language preload -->";
+const turnstileBootstrap = `<script id="openlist-pages-turnstile">
+  (function () {
+    if (window.__openlistPagesTurnstile) return;
+    window.__openlistPagesTurnstile = true;
+    function returnTo() {
+      return location.pathname + location.search + location.hash;
+    }
+    function challenge() {
+      location.replace("/api/turnstile/challenge?return_to=" + encodeURIComponent(returnTo()));
+    }
+    fetch("/api/turnstile/status", { credentials: "same-origin", cache: "no-store" })
+      .then(function (res) { return res && res.ok ? res.json() : null; })
+      .then(function (payload) {
+        var data = payload && payload.data ? payload.data : {};
+        if (data.enabled && !data.verified) challenge();
+      })
+      .catch(function () {});
+  })();
+</script>`;
 const customizeBootstrap = `<script id="openlist-pages-customize">
   (function () {
     if (window.__openlistPagesCustomizeObserver) return;
@@ -106,8 +125,8 @@ if (process.env.GITHUB_TOKEN) {
 
 const pagesRoutes = {
   version: 1,
-  include: ["/*"],
-  exclude: ["/assets/*", "/images/*", "/static/*", "/streamer/*", "/VERSION"],
+  include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
+  exclude: [],
 };
 
 const pagesHeaders = `/assets/*
@@ -207,11 +226,20 @@ async function patchIndexHtml() {
   });
   html = await injectPreloadLinks(html);
   html = await injectLanguagePreloadScript(html);
+  html = injectTurnstileBootstrap(html);
   if (!replacedCustomize) html = injectCustomizeBootstrap(html);
   html = html
     .replace(/\n<meta charset=/i, "\n    <meta charset=")
     .replace(/\n\s*\n    <meta charset=/i, "\n    <meta charset=");
   await writeFile(indexPath, html);
+}
+
+function injectTurnstileBootstrap(html) {
+  html = html.replace(/<script\b[^>]*id=["']openlist-pages-turnstile["'][\s\S]*?<\/script>\s*/i, "");
+  const block = turnstileBootstrap.replace(/\n/g, "\n    ");
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
+  return html.replace("</head>", `    ${block}\n  </head>`);
 }
 
 function injectCustomizeBootstrap(html) {

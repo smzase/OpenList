@@ -2,6 +2,25 @@
 <html lang="en" translate="no">
   <head>
     <!-- customize head -->
+    <script id="openlist-pages-turnstile">
+      (function () {
+        if (window.__openlistPagesTurnstile) return;
+        window.__openlistPagesTurnstile = true;
+        function returnTo() {
+          return location.pathname + location.search + location.hash;
+        }
+        function challenge() {
+          location.replace("/api/turnstile/challenge?return_to=" + encodeURIComponent(returnTo()));
+        }
+        fetch("/api/turnstile/status", { credentials: "same-origin", cache: "no-store" })
+          .then(function (res) { return res && res.ok ? res.json() : null; })
+          .then(function (payload) {
+            var data = payload && payload.data ? payload.data : {};
+            if (data.enabled && !data.verified) challenge();
+          })
+          .catch(function () {});
+      })();
+    </script>
     <!-- openlist pages preloads -->
     <link rel="preload" as="fetch" crossorigin href="/api/public/settings">
     <link rel="modulepreload" crossorigin href="/assets/index-qF4sv01e.js" >

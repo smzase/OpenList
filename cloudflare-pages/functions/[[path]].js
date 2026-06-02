@@ -183,6 +183,8 @@ export async function onRequest(context) {
       if (assetResp.status !== 404) return staticAssetResponse(assetResp, path);
     }
 
+    if (path === "/api/turnstile/status") return turnstileStatus(request, env);
+    if (path === "/api/turnstile/challenge") return turnstileChallengeResponse(request, env, 200);
     if (path === "/api/turnstile/verify") return turnstileVerify(request, env);
 
     const turnstileGate = await requireTurnstile(request, env, path);
@@ -269,6 +271,8 @@ async function requireTurnstile(request, env, path) {
 
 function isTurnstileBypassPath(path) {
   return (
+    path === "/api/turnstile/status" ||
+    path === "/api/turnstile/challenge" ||
     path === "/api/turnstile/verify" ||
     path === "/ping" ||
     (isStaticAssetRequest(path) && !isDynamicAssetRoute(path))
@@ -334,17 +338,26 @@ async function turnstileVerify(request, env) {
   );
 }
 
+async function turnstileStatus(request, env) {
+  const enabled = turnstileEnabled(env);
+  return ok({
+    enabled,
+    verified: enabled ? await hasValidTurnstilePass(request, env) : false,
+    challenge_url: "/api/turnstile/challenge",
+  }, { "Cache-Control": "no-store" });
+}
+
 function turnstileRequiredJson() {
   return json({
     code: 403,
     message: "Turnstile verification required",
-    data: { verify_url: "/api/turnstile/verify" },
+    data: { challenge_url: "/api/turnstile/challenge", verify_url: "/api/turnstile/verify" },
   }, 403, { "Cache-Control": "no-store" });
 }
 
-function turnstileChallengeResponse(request, env) {
+function turnstileChallengeResponse(request, env, status = 403) {
   return new Response(turnstileChallengeHtml(request, env), {
-    status: 403,
+    status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
@@ -361,11 +374,10 @@ function turnstileChallengeHtml(request, env) {
     siteKeyMissing ? "OPENLIST_TURNSTILE_SITE_KEY" : "",
     secretMissing ? "OPENLIST_TURNSTILE_SECRET_KEY" : "",
   ].filter(Boolean).join(" and ");
-  const url = new URL(request.url);
-  const returnTo = `${url.pathname}${url.search}`;
+  const returnTo = turnstileReturnTo(request);
   const notice = configMissing
     ? `<div class="notice">${escapeHtml(missingKeys)} ${missingKeys.includes(" and ") ? "are" : "is"} not configured in Cloudflare Pages.</div>`
-    : `<div class="cf-turnstile" data-sitekey="${escapeAttr(siteKey)}" data-callback="openlistTurnstileCallback" data-expired-callback="openlistTurnstileExpired" data-error-callback="openlistTurnstileError"></div>`;
+    : `<div class="cf-turnstile" data-sitekey="${escapeAttr(siteKey)}" data-callback="openlistTurnstileCallback" data-expired-callback="openlistTurnstileExpired" data-error-callback="openlistTurnstileError" data-theme="auto"></div>`;
   const script = configMissing ? "" : `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>`;
   return `<!doctype html>
 <html lang="en">
@@ -375,17 +387,24 @@ function turnstileChallengeHtml(request, env) {
 <meta name="robots" content="noindex,nofollow">
 <title>Security check - OpenList</title>
 <style>
-:root{color-scheme:light dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+:root{color-scheme:light dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--bg:#f4f7fb;--panel:#fff;--text:#172033;--muted:#667085;--line:#d8dee8;--blue:#2563eb;--blue-soft:#eff6ff;--green:#10b981;--shadow:0 24px 70px rgba(15,23,42,.14)}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fb;color:#172033;padding:24px}
-.panel{width:min(420px,100%);border:1px solid #d8dee8;background:#fff;border-radius:8px;padding:24px;box-shadow:0 18px 50px rgba(15,23,42,.12)}
-.eyebrow{margin:0 0 8px;color:#2563eb;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
-h1{margin:0 0 10px;font-size:26px;line-height:1.2}
-p{margin:0 0 18px;color:#475569;line-height:1.55}
-.widget{min-height:70px;display:flex;align-items:center}
-.status{margin-top:14px;color:#64748b;font-size:14px;min-height:20px}
-.notice{border:1px solid #f3c969;background:#fff8e1;color:#854d0e;border-radius:6px;padding:12px;line-height:1.45}
-@media(prefers-color-scheme:dark){body{background:#101827;color:#e5e7eb}.panel{background:#182235;border-color:#334155}.eyebrow{color:#60a5fa}p,.status{color:#94a3b8}.notice{background:#3a2d12;border-color:#854d0e;color:#fde68a}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 20% 15%,rgba(37,99,235,.12),transparent 34%),linear-gradient(135deg,#f8fafc 0%,var(--bg) 54%,#eef2f7 100%);color:var(--text);padding:24px}
+.shell{width:min(460px,100%);display:grid;gap:14px}
+.panel{border:1px solid var(--line);background:color-mix(in srgb,var(--panel) 94%,transparent);border-radius:10px;padding:26px;box-shadow:var(--shadow);backdrop-filter:blur(10px)}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+.mark{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#2563eb,#14b8a6);display:grid;place-items:center;color:#fff;font-weight:800;box-shadow:0 10px 28px rgba(37,99,235,.22)}
+.brand-title{font-weight:750;font-size:17px}
+.badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #bfdbfe;background:var(--blue-soft);color:#1d4ed8;border-radius:999px;padding:6px 10px;font-size:13px;font-weight:650;margin-bottom:14px}
+.dot{width:8px;height:8px;border-radius:999px;background:var(--green);box-shadow:0 0 0 4px rgba(16,185,129,.14)}
+h1{margin:0 0 10px;font-size:28px;line-height:1.15;letter-spacing:0}
+p{margin:0;color:var(--muted);line-height:1.55}
+.widget{margin-top:22px;min-height:78px;display:flex;align-items:center;justify-content:center;border:1px dashed #cbd5e1;border-radius:8px;background:#f8fafc;padding:14px}
+.status{margin-top:14px;color:var(--muted);font-size:14px;min-height:20px;text-align:center}
+.hint{margin-top:18px;border-top:1px solid #eef2f7;padding-top:14px;font-size:13px;color:var(--muted);text-align:center}
+.notice{border:1px solid #f3c969;background:#fff8e1;color:#854d0e;border-radius:8px;padding:12px;line-height:1.45}
+@media(max-width:520px){body{padding:16px}.panel{padding:22px}h1{font-size:25px}}
+@media(prefers-color-scheme:dark){:root{--bg:#101827;--panel:#182235;--text:#e5e7eb;--muted:#94a3b8;--line:#334155;--blue-soft:#172554;--shadow:0 24px 70px rgba(0,0,0,.35)}body{background:radial-gradient(circle at 20% 15%,rgba(96,165,250,.16),transparent 34%),linear-gradient(135deg,#0f172a 0%,#111827 58%,#0b1120 100%)}.badge{border-color:#1d4ed8;color:#bfdbfe}.widget{background:#111827;border-color:#334155}.hint{border-color:#334155}.notice{background:#3a2d12;border-color:#854d0e;color:#fde68a}}
 </style>
 <script>
 var openlistTurnstileReturnTo = ${scriptJson(returnTo)};
@@ -419,17 +438,28 @@ window.openlistTurnstileError = function() {
 </script>
 </head>
 <body>
-<main class="panel">
-  <p class="eyebrow">Cloudflare Turnstile</p>
-  <h1>Security check</h1>
-  <p>Complete the check to continue to OpenList.</p>
-  <div class="widget">${notice}</div>
-  <div id="turnstile-status" class="status">${configMissing ? "Turnstile cannot verify until the required environment variables are configured." : "Waiting for verification..."}</div>
-  <noscript><p class="notice">JavaScript is required to complete this check.</p></noscript>
+<main class="shell">
+  <section class="panel">
+    <div class="brand"><div class="mark">O</div><div class="brand-title">OpenList</div></div>
+    <div class="badge"><span class="dot"></span>Cloudflare Turnstile</div>
+    <h1>Security check</h1>
+    <p>Complete this quick verification to continue browsing. Your pass stays active for 20 minutes.</p>
+    <div class="widget">${notice}</div>
+    <div id="turnstile-status" class="status">${configMissing ? "Turnstile cannot verify until the required environment variables are configured." : "Waiting for verification..."}</div>
+    <div class="hint">This check helps protect the file list and login endpoint from automated traffic.</div>
+    <noscript><p class="notice">JavaScript is required to complete this check.</p></noscript>
+  </section>
 </main>
 ${script}
 </body>
 </html>`;
+}
+
+function turnstileReturnTo(request) {
+  const url = new URL(request.url);
+  const explicit = url.searchParams.get("return_to");
+  if (explicit && explicit.startsWith("/") && !explicit.startsWith("//")) return explicit;
+  return `${url.pathname}${url.search}`;
 }
 
 function turnstileSiteKey(env) {

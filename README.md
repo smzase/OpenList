@@ -44,7 +44,7 @@ cloudflare-pages/
 ```
 
 - `dist/index.html`：内置官方 OpenList 前端入口。
-- `dist/_routes.json`：让页面、`/api/*`、`/d/*` 等路由进入 Pages Functions 以执行 Turnstile 门禁，静态资源由 Pages 静态层直接服务。
+- `dist/_routes.json`：只让 `/api/*`、`/d/*` 等后端路由进入 Pages Functions，前端页面和静态资源由 Pages 静态层直接服务。
 - `dist/_headers`：给前端静态资源设置长期浏览器缓存。
 - `dist/_redirects`：让前端路由刷新时回到 `index.html`。
 - `functions/[[path]].js`：Pages Functions 后端逻辑。
@@ -100,12 +100,12 @@ cloudflare-pages/
 
 Pages 版已经内置可选 Turnstile 整站门禁。只有同时配置 `OPENLIST_TURNSTILE_SITE_KEY` 和 `OPENLIST_TURNSTILE_SECRET_KEY` 时才会启用；不配置时保持原来的公开访问行为。
 
-启用后，访客访问页面、API 或下载链接前需要先完成 Turnstile 验证；登录接口也要求同一个 Turnstile 通过 cookie，避免绕过访问门禁。
+启用后，前端首页会先通过 `/api/turnstile/status` 检查是否已经验证；未验证时跳转到 Turnstile 挑战页。API、下载链接和登录接口也要求同一个 Turnstile 通过 cookie，避免绕过访问门禁。
 
 - Widget mode 在 Cloudflare 后台配置为 `Managed` 即可，代码不需要额外设置模式。
 - 通过验证后会写入 `openlist_turnstile` HttpOnly cookie，有效期为 20 分钟。
 - `OPENLIST_TURNSTILE_SITE_KEY` 和 `OPENLIST_TURNSTILE_SECRET_KEY` 都需要使用 Turnstile 后台生成的值；只配置其中一个会视为未启用。
-- `/assets/*`、`/images/*`、`/static/*`、`/streamer/*` 等静态资源不会进入门禁，保证挑战页和前端资源可以正常加载。
+- 前端页面和 `/assets/*`、`/images/*`、`/static/*`、`/streamer/*` 等静态资源不会进入 Pages Function，保证官方前端样式和资源正常加载。
 
 ## OneDrive 存储配置
 
