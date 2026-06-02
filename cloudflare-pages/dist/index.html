@@ -10,15 +10,20 @@
           return location.pathname + location.search + location.hash;
         }
         function challenge() {
+          try { document.documentElement.style.visibility = "hidden"; } catch (error) {}
           location.replace("/api/turnstile/challenge?return_to=" + encodeURIComponent(returnTo()));
         }
-        fetch("/api/turnstile/status", { credentials: "same-origin", cache: "no-store" })
-          .then(function (res) { return res && res.ok ? res.json() : null; })
-          .then(function (payload) {
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open("GET", "/api/turnstile/status", false);
+          xhr.withCredentials = true;
+          xhr.send(null);
+          if (xhr.status >= 200 && xhr.status < 300) {
+            var payload = JSON.parse(xhr.responseText || "{}");
             var data = payload && payload.data ? payload.data : {};
             if (data.enabled && !data.verified) challenge();
-          })
-          .catch(function () {});
+          }
+        } catch (error) {}
       })();
     </script>
     <!-- openlist pages preloads -->
