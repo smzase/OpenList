@@ -22,7 +22,7 @@ const DIRECTORY_REVALIDATE_LOCK_SECONDS = 60;
 const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v3";
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const TURNSTILE_COOKIE = "openlist_turnstile";
-const TURNSTILE_PASS_SECONDS = 20 * 60;
+const TURNSTILE_PASS_SECONDS = 30 * 60;
 const ONEDRIVE_LIST_SELECT = [
   "id",
   "name",

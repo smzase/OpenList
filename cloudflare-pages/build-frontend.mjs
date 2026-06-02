@@ -19,6 +19,7 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
     var statusPath = "/api/turnstile/status";
     var challengePath = "/api/turnstile/challenge";
     var verifyPath = "/api/turnstile/verify";
+    var lastRenew = 0;
     function returnTo() {
       return location.pathname + location.search + location.hash;
     }
@@ -49,6 +50,7 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
       res.clone().json().then(inspectPayload).catch(function () {});
     }
     function checkStatus(sync) {
+      lastRenew = Date.now();
       if (sync) {
         try {
           var xhr = new XMLHttpRequest();
@@ -70,6 +72,11 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
           if (data.enabled && !data.verified) challenge();
         })
         .catch(function () {});
+    }
+    function renewSoon() {
+      var now = Date.now();
+      if (now - lastRenew < 60 * 1000) return;
+      checkStatus(false);
     }
     var nativeFetch = window.fetch;
     if (nativeFetch) {
@@ -97,7 +104,19 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
     };
     checkStatus(true);
     if (window.setInterval) {
-      window.setInterval(function () { checkStatus(false); }, 5 * 60 * 1000);
+      window.setInterval(function () { checkStatus(false); }, 12 * 60 * 1000);
+    }
+    document.addEventListener("play", renewSoon, true);
+    document.addEventListener("playing", renewSoon, true);
+    document.addEventListener("timeupdate", renewSoon, true);
+    document.addEventListener("seeking", renewSoon, true);
+    document.addEventListener("waiting", renewSoon, true);
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", function () {
+        Array.prototype.forEach.call(document.querySelectorAll("audio,video"), function (media) {
+          if (!media.paused && !media.ended) renewSoon();
+        });
+      }, { once: true });
     }
   })();
 </script>`;
