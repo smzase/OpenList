@@ -16,24 +16,89 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
   (function () {
     if (window.__openlistPagesTurnstile) return;
     window.__openlistPagesTurnstile = true;
+    var statusPath = "/api/turnstile/status";
+    var challengePath = "/api/turnstile/challenge";
+    var verifyPath = "/api/turnstile/verify";
     function returnTo() {
       return location.pathname + location.search + location.hash;
     }
     function challenge() {
       try { document.documentElement.style.visibility = "hidden"; } catch (error) {}
-      location.replace("/api/turnstile/challenge?return_to=" + encodeURIComponent(returnTo()));
+      location.replace(challengePath + "?return_to=" + encodeURIComponent(returnTo()));
     }
-    try {
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", "/api/turnstile/status", false);
-      xhr.withCredentials = true;
-      xhr.send(null);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        var payload = JSON.parse(xhr.responseText || "{}");
-        var data = payload && payload.data ? payload.data : {};
-        if (data.enabled && !data.verified) challenge();
+    function pathOf(input) {
+      try {
+        var raw = typeof input === "string" ? input : input && input.url;
+        return raw ? new URL(raw, location.href).pathname : "";
+      } catch (error) {
+        return "";
       }
-    } catch (error) {}
+    }
+    function payloadNeedsChallenge(payload) {
+      var data = payload && payload.data ? payload.data : {};
+      return !!(data.challenge_url || data.verify_url || payload && payload.message === "Turnstile verification required");
+    }
+    function inspectPayload(payload) {
+      if (payloadNeedsChallenge(payload)) challenge();
+    }
+    function inspectResponse(res, input) {
+      if (!res || res.status !== 403) return;
+      var path = pathOf(input || res.url);
+      if (path === statusPath || path === challengePath || path === verifyPath) return;
+      if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
+      res.clone().json().then(inspectPayload).catch(function () {});
+    }
+    function checkStatus(sync) {
+      if (sync) {
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open("GET", statusPath, false);
+          xhr.withCredentials = true;
+          xhr.send(null);
+          if (xhr.status >= 200 && xhr.status < 300) {
+            var payload = JSON.parse(xhr.responseText || "{}");
+            var data = payload && payload.data ? payload.data : {};
+            if (data.enabled && !data.verified) challenge();
+          }
+        } catch (error) {}
+        return;
+      }
+      fetch(statusPath, { credentials: "same-origin", cache: "no-store" })
+        .then(function (res) { return res && res.ok ? res.json() : null; })
+        .then(function (payload) {
+          var data = payload && payload.data ? payload.data : {};
+          if (data.enabled && !data.verified) challenge();
+        })
+        .catch(function () {});
+    }
+    var nativeFetch = window.fetch;
+    if (nativeFetch) {
+      window.fetch = function (input, init) {
+        var promise = nativeFetch.apply(this, arguments);
+        promise.then(function (res) { inspectResponse(res, input); }).catch(function () {});
+        return promise;
+      };
+    }
+    var nativeOpen = XMLHttpRequest.prototype.open;
+    var nativeSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__openlistTurnstileUrl = url;
+      return nativeOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      this.addEventListener("load", function () {
+        if (this.status !== 403) return;
+        var path = pathOf(this.__openlistTurnstileUrl || "");
+        if (path === statusPath || path === challengePath || path === verifyPath) return;
+        if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
+        try { inspectPayload(JSON.parse(this.responseText || "{}")); } catch (error) {}
+      });
+      return nativeSend.apply(this, arguments);
+    };
+    checkStatus(true);
+    if (window.setInterval) {
+      window.setInterval(function () { checkStatus(false); }, 5 * 60 * 1000);
+    }
   })();
 </script>`;
 const customizeBootstrap = `<script id="openlist-pages-customize">

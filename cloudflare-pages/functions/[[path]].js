@@ -340,11 +340,17 @@ async function turnstileVerify(request, env) {
 
 async function turnstileStatus(request, env) {
   const enabled = turnstileEnabled(env);
+  const verified = enabled ? await hasValidTurnstilePass(request, env) : false;
+  const headers = { "Cache-Control": "no-store" };
+  if (verified) {
+    headers["Set-Cookie"] = await turnstilePassCookie(env, nowSeconds() + TURNSTILE_PASS_SECONDS);
+  }
   return ok({
     enabled,
-    verified: enabled ? await hasValidTurnstilePass(request, env) : false,
+    verified,
+    expires_in: verified ? TURNSTILE_PASS_SECONDS : 0,
     challenge_url: "/api/turnstile/challenge",
-  }, { "Cache-Control": "no-store" });
+  }, headers);
 }
 
 function turnstileRequiredJson() {

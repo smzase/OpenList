@@ -103,7 +103,7 @@ Pages 版已经内置可选 Turnstile 整站门禁。只有同时配置 `OPENLIS
 启用后，前端首页会先通过 `/api/turnstile/status` 检查是否已经验证；未验证时跳转到 Turnstile 挑战页。API、下载链接和登录接口也要求同一个 Turnstile 通过 cookie，避免绕过访问门禁。
 
 - Widget mode 在 Cloudflare 后台配置为 `Managed` 即可，代码不需要额外设置模式。
-- 通过验证后会写入 `openlist_turnstile` HttpOnly cookie，有效期为 20 分钟。
+- 通过验证后会写入 `openlist_turnstile` HttpOnly cookie，空闲有效期为 20 分钟；页面打开期间会定时续期，避免在线播放时中途过期。
 - `OPENLIST_TURNSTILE_SITE_KEY` 和 `OPENLIST_TURNSTILE_SECRET_KEY` 都需要使用 Turnstile 后台生成的值；只配置其中一个会视为未启用。
 - 前端页面和 `/assets/*`、`/images/*`、`/static/*`、`/streamer/*` 等静态资源不会进入 Pages Function，保证官方前端样式和资源正常加载。
 
