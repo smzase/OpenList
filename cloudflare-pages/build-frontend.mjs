@@ -12,6 +12,52 @@ const preloadEnd = "<!-- /openlist pages preloads -->";
 const settingsPreload = `<link rel="preload" as="fetch" crossorigin href="/api/public/settings">`;
 const langPreloadStart = "<!-- openlist pages language preload -->";
 const langPreloadEnd = "<!-- /openlist pages language preload -->";
+const loadingImageBootstrap = `<style id="openlist-pages-loading-image-style">
+  .openlist-loading-image {
+    width: 100px !important;
+    height: 100px !important;
+    border: 0 !important;
+    border-radius: 14px !important;
+    background: url("/images/loading.webp") center / cover no-repeat !important;
+    animation: none !important;
+    color: transparent !important;
+    overflow: hidden !important;
+    box-sizing: border-box !important;
+  }
+  .openlist-loading-image > * {
+    opacity: 0 !important;
+  }
+</style>
+<script id="openlist-pages-loading-image">
+  (function () {
+    if (window.__openlistPagesLoadingImage) return;
+    window.__openlistPagesLoadingImage = true;
+    function isFullScreenLoader(spinner) {
+      var rect = spinner.getBoundingClientRect();
+      if (Math.max(rect.width, rect.height) < 40) return false;
+      var parent = spinner.parentElement;
+      for (var i = 0; parent && i < 6; i++, parent = parent.parentElement) {
+        var box = parent.getBoundingClientRect();
+        if (box.height >= window.innerHeight * 0.5 && box.width >= window.innerWidth * 0.5) return true;
+      }
+      return false;
+    }
+    function scan() {
+      var spinners = document.querySelectorAll(".hope-spinner");
+      for (var i = 0; i < spinners.length; i++) {
+        var spinner = spinners[i];
+        if (isFullScreenLoader(spinner)) spinner.classList.add("openlist-loading-image");
+      }
+    }
+    function scheduleScan() {
+      requestAnimationFrame(function () { requestAnimationFrame(scan); });
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", scheduleScan, { once: true });
+    else scheduleScan();
+    new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
+    window.addEventListener("resize", scheduleScan);
+  })();
+</script>`;
 const turnstileBootstrap = `<script id="openlist-pages-turnstile">
   (function () {
     if (window.__openlistPagesTurnstile) return;
@@ -315,12 +361,22 @@ async function patchIndexHtml() {
   });
   html = await injectPreloadLinks(html);
   html = await injectLanguagePreloadScript(html);
+  html = injectLoadingImageBootstrap(html);
   html = injectTurnstileBootstrap(html);
   if (!replacedCustomize) html = injectCustomizeBootstrap(html);
   html = html
     .replace(/\n<meta charset=/i, "\n    <meta charset=")
     .replace(/\n\s*\n    <meta charset=/i, "\n    <meta charset=");
   await writeFile(indexPath, html);
+}
+
+function injectLoadingImageBootstrap(html) {
+  html = html.replace(/<style\b[^>]*id=["']openlist-pages-loading-image-style["'][\s\S]*?<\/style>\s*/i, "");
+  html = html.replace(/<script\b[^>]*id=["']openlist-pages-loading-image["'][\s\S]*?<\/script>\s*/i, "");
+  const block = loadingImageBootstrap.replace(/\n/g, "\n    ");
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
+  return html.replace("</head>", `    ${block}\n  </head>`);
 }
 
 function injectTurnstileBootstrap(html) {
