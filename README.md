@@ -44,7 +44,7 @@ cloudflare-pages/
 ```
 
 - `dist/index.html`：内置官方 OpenList 前端入口。
-- `dist/_routes.json`：只让 `/api/*`、`/d/*` 等后端路由进入 Pages Functions，前端页面和静态资源由 Pages 静态层直接服务。
+- `dist/_routes.json`：让页面、`/api/*`、`/d/*` 等路由进入 Pages Functions 以执行 Turnstile 门禁，静态资源由 Pages 静态层直接服务。
 - `dist/_headers`：给前端静态资源设置长期浏览器缓存。
 - `dist/_redirects`：让前端路由刷新时回到 `index.html`。
 - `functions/[[path]].js`：Pages Functions 后端逻辑。
@@ -72,6 +72,8 @@ cloudflare-pages/
    - `OPENLIST_ADMIN_PASSWORD`：初始管理员密码
    - `OPENLIST_JWT_SECRET`：用于签名下载链接的长随机字符串
    - `OPENLIST_WEB_CDN`：可选，OpenList 前端 CDN 地址；通常可以留空，因为官方前端已经内置在 `dist` 中
+   - `OPENLIST_TURNSTILE_SITE_KEY`：可选，Cloudflare Turnstile Site key；启用 Turnstile 时需要配置
+   - `OPENLIST_TURNSTILE_SECRET_KEY`：可选，Cloudflare Turnstile Secret key；启用 Turnstile 时需要配置，不要提交真实密钥
 10. 部署 Pages 项目。
 
 如果构建日志出现 `Output directory "cloudflare-pages/dist" not found`，通常是下面两种原因之一：
@@ -93,6 +95,17 @@ cloudflare-pages/
 默认不需要配置 `OPENLIST_WEB_CDN`。官方前端已经直接放在 `cloudflare-pages/dist` 中，Cloudflare Pages 部署时不需要联网下载前端。
 
 `cloudflare-pages/build-frontend.mjs` 只用于以后手动更新官方前端版本，部署时可以不用执行。
+
+## Cloudflare Turnstile
+
+Pages 版已经内置可选 Turnstile 整站门禁。只有同时配置 `OPENLIST_TURNSTILE_SITE_KEY` 和 `OPENLIST_TURNSTILE_SECRET_KEY` 时才会启用；不配置时保持原来的公开访问行为。
+
+启用后，访客访问页面、API 或下载链接前需要先完成 Turnstile 验证；登录接口也要求同一个 Turnstile 通过 cookie，避免绕过访问门禁。
+
+- Widget mode 在 Cloudflare 后台配置为 `Managed` 即可，代码不需要额外设置模式。
+- 通过验证后会写入 `openlist_turnstile` HttpOnly cookie，有效期为 20 分钟。
+- `OPENLIST_TURNSTILE_SITE_KEY` 和 `OPENLIST_TURNSTILE_SECRET_KEY` 都需要使用 Turnstile 后台生成的值；只配置其中一个会视为未启用。
+- `/assets/*`、`/images/*`、`/static/*`、`/streamer/*` 等静态资源不会进入门禁，保证挑战页和前端资源可以正常加载。
 
 ## OneDrive 存储配置
 

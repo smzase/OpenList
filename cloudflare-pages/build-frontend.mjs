@@ -106,8 +106,8 @@ if (process.env.GITHUB_TOKEN) {
 
 const pagesRoutes = {
   version: 1,
-  include: ["/api/*", "/d/*", "/ping", "/manifest.json", "/robots.txt", "/favicon.ico"],
-  exclude: [],
+  include: ["/*"],
+  exclude: ["/assets/*", "/images/*", "/static/*", "/streamer/*", "/VERSION"],
 };
 
 const pagesHeaders = `/assets/*

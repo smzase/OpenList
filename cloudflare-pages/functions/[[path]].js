@@ -20,6 +20,9 @@ const SESSION_CACHE_SECONDS = 60;
 const LONG_CACHE_SECONDS = 30 * 24 * 3600;
 const DIRECTORY_REVALIDATE_LOCK_SECONDS = 60;
 const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v3";
+const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const TURNSTILE_COOKIE = "openlist_turnstile";
+const TURNSTILE_PASS_SECONDS = 20 * 60;
 const ONEDRIVE_LIST_SELECT = [
   "id",
   "name",
@@ -180,6 +183,11 @@ export async function onRequest(context) {
       if (assetResp.status !== 404) return staticAssetResponse(assetResp, path);
     }
 
+    if (path === "/api/turnstile/verify") return turnstileVerify(request, env);
+
+    const turnstileGate = await requireTurnstile(request, env, path);
+    if (turnstileGate) return turnstileGate;
+
     if (!env.OPENLIST_DB) {
       return text("OPENLIST_DB D1 binding is missing", 500);
     }
@@ -248,6 +256,201 @@ async function apiRouter(request, env, path, context) {
   if (path.startsWith("/api/admin/message/")) return requireAdmin(request, env, () => adminMessage(request, env, path));
   if (path.startsWith("/api/admin/")) return requireAdmin(request, env, () => adminCompat(path));
   return apiError("api not found", 404);
+}
+
+async function requireTurnstile(request, env, path) {
+  if (!turnstileEnabled(env)) return null;
+  if (isTurnstileBypassPath(path)) return null;
+  if (await hasValidTurnstilePass(request, env)) return null;
+  if (path.startsWith("/api/")) return turnstileRequiredJson();
+  if (request.method !== "GET" && request.method !== "HEAD") return turnstileRequiredJson();
+  return turnstileChallengeResponse(request, env);
+}
+
+function isTurnstileBypassPath(path) {
+  return (
+    path === "/api/turnstile/verify" ||
+    path === "/ping" ||
+    (isStaticAssetRequest(path) && !isDynamicAssetRoute(path))
+  );
+}
+
+async function hasValidTurnstilePass(request, env) {
+  const secret = turnstileSecretKey(env);
+  if (!secret) return false;
+  const value = cookieValue(request, TURNSTILE_COOKIE);
+  const parts = value.split(".");
+  if (parts.length !== 2) return false;
+  const expiresAt = Number(parts[0]);
+  const signature = String(parts[1] || "").toLowerCase();
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= nowSeconds() || !/^[a-f0-9]{64}$/.test(signature)) return false;
+  const expected = await turnstileCookieSignature(env, expiresAt);
+  return timingSafeEqual(expected, signature);
+}
+
+async function turnstileVerify(request, env) {
+  if (!turnstileEnabled(env)) {
+    return json({ code: 400, message: "Turnstile is not enabled", data: null }, 400, { "Cache-Control": "no-store" });
+  }
+  if (request.method !== "POST") {
+    return json({ code: 405, message: "method not allowed", data: null }, 405, { "Cache-Control": "no-store" });
+  }
+  const secret = turnstileSecretKey(env);
+  const body = await readBody(request);
+  const token = String(body.token || body.response || body["cf-turnstile-response"] || "").trim();
+  if (!token) {
+    return json({ code: 400, message: "Turnstile token is required", data: null }, 400, { "Cache-Control": "no-store" });
+  }
+
+  const form = new URLSearchParams();
+  form.set("secret", secret);
+  form.set("response", token);
+  const remoteIp = request.headers.get("CF-Connecting-IP") || request.headers.get("x-forwarded-for") || "";
+  if (remoteIp) form.set("remoteip", remoteIp.split(",")[0].trim());
+
+  const verifyResp = await fetch(TURNSTILE_VERIFY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+  }).catch((error) => {
+    throw new Error(`Turnstile siteverify request failed: ${error && error.message ? error.message : error}`);
+  });
+  const verifyData = await verifyResp.json().catch(() => null);
+  if (!verifyResp.ok || !verifyData || !verifyData.success) {
+    return json({
+      code: 403,
+      message: "Turnstile verification failed",
+      data: { error_codes: verifyData ? verifyData["error-codes"] || [] : [] },
+    }, 403, { "Cache-Control": "no-store" });
+  }
+
+  const expiresAt = nowSeconds() + TURNSTILE_PASS_SECONDS;
+  return ok(
+    { expires_at: expiresAt, expires_in: TURNSTILE_PASS_SECONDS },
+    {
+      "Cache-Control": "no-store",
+      "Set-Cookie": await turnstilePassCookie(env, expiresAt),
+    },
+  );
+}
+
+function turnstileRequiredJson() {
+  return json({
+    code: 403,
+    message: "Turnstile verification required",
+    data: { verify_url: "/api/turnstile/verify" },
+  }, 403, { "Cache-Control": "no-store" });
+}
+
+function turnstileChallengeResponse(request, env) {
+  return new Response(turnstileChallengeHtml(request, env), {
+    status: 403,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+function turnstileChallengeHtml(request, env) {
+  const siteKey = turnstileSiteKey(env);
+  const secretMissing = !turnstileSecretKey(env);
+  const siteKeyMissing = !siteKey;
+  const configMissing = secretMissing || siteKeyMissing;
+  const missingKeys = [
+    siteKeyMissing ? "OPENLIST_TURNSTILE_SITE_KEY" : "",
+    secretMissing ? "OPENLIST_TURNSTILE_SECRET_KEY" : "",
+  ].filter(Boolean).join(" and ");
+  const url = new URL(request.url);
+  const returnTo = `${url.pathname}${url.search}`;
+  const notice = configMissing
+    ? `<div class="notice">${escapeHtml(missingKeys)} ${missingKeys.includes(" and ") ? "are" : "is"} not configured in Cloudflare Pages.</div>`
+    : `<div class="cf-turnstile" data-sitekey="${escapeAttr(siteKey)}" data-callback="openlistTurnstileCallback" data-expired-callback="openlistTurnstileExpired" data-error-callback="openlistTurnstileError"></div>`;
+  const script = configMissing ? "" : `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Security check - OpenList</title>
+<style>
+:root{color-scheme:light dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fb;color:#172033;padding:24px}
+.panel{width:min(420px,100%);border:1px solid #d8dee8;background:#fff;border-radius:8px;padding:24px;box-shadow:0 18px 50px rgba(15,23,42,.12)}
+.eyebrow{margin:0 0 8px;color:#2563eb;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+h1{margin:0 0 10px;font-size:26px;line-height:1.2}
+p{margin:0 0 18px;color:#475569;line-height:1.55}
+.widget{min-height:70px;display:flex;align-items:center}
+.status{margin-top:14px;color:#64748b;font-size:14px;min-height:20px}
+.notice{border:1px solid #f3c969;background:#fff8e1;color:#854d0e;border-radius:6px;padding:12px;line-height:1.45}
+@media(prefers-color-scheme:dark){body{background:#101827;color:#e5e7eb}.panel{background:#182235;border-color:#334155}.eyebrow{color:#60a5fa}p,.status{color:#94a3b8}.notice{background:#3a2d12;border-color:#854d0e;color:#fde68a}}
+</style>
+<script>
+var openlistTurnstileReturnTo = ${scriptJson(returnTo)};
+function openlistTurnstileStatus(message) {
+  var target = document.getElementById("turnstile-status");
+  if (target) target.textContent = message || "";
+}
+window.openlistTurnstileCallback = async function(token) {
+  openlistTurnstileStatus("Verifying...");
+  try {
+    var resp = await fetch("/api/turnstile/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token })
+    });
+    var data = await resp.json().catch(function(){ return {}; });
+    if (!resp.ok || data.code !== 200) throw new Error(data.message || "Verification failed");
+    openlistTurnstileStatus("Verified. Continuing...");
+    location.replace(openlistTurnstileReturnTo || "/");
+  } catch (error) {
+    openlistTurnstileStatus(error && error.message ? error.message : "Verification failed");
+    if (window.turnstile) window.turnstile.reset();
+  }
+};
+window.openlistTurnstileExpired = function() {
+  openlistTurnstileStatus("Verification expired. Please try again.");
+};
+window.openlistTurnstileError = function() {
+  openlistTurnstileStatus("Verification failed to load. Please refresh and try again.");
+};
+</script>
+</head>
+<body>
+<main class="panel">
+  <p class="eyebrow">Cloudflare Turnstile</p>
+  <h1>Security check</h1>
+  <p>Complete the check to continue to OpenList.</p>
+  <div class="widget">${notice}</div>
+  <div id="turnstile-status" class="status">${configMissing ? "Turnstile cannot verify until the required environment variables are configured." : "Waiting for verification..."}</div>
+  <noscript><p class="notice">JavaScript is required to complete this check.</p></noscript>
+</main>
+${script}
+</body>
+</html>`;
+}
+
+function turnstileSiteKey(env) {
+  return String(env.OPENLIST_TURNSTILE_SITE_KEY || "").trim();
+}
+
+function turnstileSecretKey(env) {
+  return String(env.OPENLIST_TURNSTILE_SECRET_KEY || "").trim();
+}
+
+function turnstileEnabled(env) {
+  return !!turnstileSiteKey(env) && !!turnstileSecretKey(env);
+}
+
+async function turnstilePassCookie(env, expiresAt) {
+  const value = `${expiresAt}.${await turnstileCookieSignature(env, expiresAt)}`;
+  return `${TURNSTILE_COOKIE}=${encodeURIComponent(value)}; Path=/; Max-Age=${TURNSTILE_PASS_SECONDS}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+async function turnstileCookieSignature(env, expiresAt) {
+  return hmacHex(turnstileSecretKey(env), `turnstile:${expiresAt}`);
 }
 
 async function ensureInitialized(env) {
@@ -2391,6 +2594,22 @@ function bearerToken(request) {
   if (!auth) return "";
   if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
   return auth.trim();
+}
+
+function cookieValue(request, name) {
+  const cookies = request.headers.get("cookie") || "";
+  for (const part of cookies.split(";")) {
+    const index = part.indexOf("=");
+    if (index <= 0) continue;
+    const key = part.slice(0, index).trim();
+    if (key !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(index + 1).trim());
+    } catch {
+      return part.slice(index + 1).trim();
+    }
+  }
+  return "";
 }
 
 function item(key, value, type, group, flag = FLAG_PUBLIC, options = "", help = "") {
