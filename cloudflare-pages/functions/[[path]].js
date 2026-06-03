@@ -20,7 +20,7 @@ const RUNTIME_MEMORY_TTL = 300;
 const SESSION_CACHE_SECONDS = 60;
 const LONG_CACHE_SECONDS = 30 * 24 * 3600;
 const DIRECTORY_REVALIDATE_LOCK_SECONDS = 60;
-const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v3";
+const BUILTIN_ADMIN_SCRIPT_VERSION = "storage-cache-refresh-v4";
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const TURNSTILE_COOKIE = "openlist_turnstile";
 const TURNSTILE_PASS_SECONDS = 30 * 60;
@@ -39,6 +39,7 @@ const ONEDRIVE_LIST_SELECT = [
 let initPromise = null;
 let initializedUntil = 0;
 let runtimeCacheNamespace = "default";
+let fsRuntimeCacheNamespace = "openlist-fs-v1";
 
 const GROUPS = {
   SINGLE: 0,
@@ -176,6 +177,7 @@ export async function onRequest(context) {
   const { request, env } = context;
   try {
     runtimeCacheNamespace = runtimeCacheNamespaceFromEnv(env);
+    fsRuntimeCacheNamespace = fsRuntimeCacheNamespaceFromEnv(env);
     const url = new URL(request.url);
     const path = normalizePath(url.pathname);
 
@@ -252,7 +254,7 @@ async function apiRouter(request, env, path, context) {
   });
   if (path.startsWith("/api/admin/user/")) return requireAdmin(request, env, (admin) => adminUser(request, env, path, admin));
   if (path.startsWith("/api/admin/setting/")) return requireAdmin(request, env, () => adminSetting(request, env, path));
-  if (path.startsWith("/api/admin/storage/")) return requireAdmin(request, env, () => adminStorage(request, env, path));
+  if (path.startsWith("/api/admin/storage/")) return requireAdmin(request, env, () => adminStorage(request, env, path, context));
   if (path.startsWith("/api/admin/meta/")) return requireAdmin(request, env, () => adminMeta(request, env, path));
   if (path.startsWith("/api/admin/index/")) return requireAdmin(request, env, () => adminIndex(request, env, path));
   if (path.startsWith("/api/admin/scan/")) return requireAdmin(request, env, () => adminScan(request, env, path));
@@ -798,7 +800,7 @@ async function adminSetting(request, env, path) {
   return apiError("api not found", 404);
 }
 
-async function adminStorage(request, env, path) {
+async function adminStorage(request, env, path, context = null) {
   const db = env.OPENLIST_DB;
   if (path.endsWith("/list")) {
     const page = pageReq(await readBody(request), request);
@@ -849,19 +851,45 @@ async function adminStorage(request, env, path) {
     const body = await readBody(request);
     const id = Number(body.id || new URL(request.url).searchParams.get("id") || 0);
     let changed = 0;
+    let refreshedStorages = [];
     if (id > 0) {
       const result = await db.prepare("UPDATE storages SET modified = CURRENT_TIMESTAMP WHERE id = ?").bind(id).run();
       changed = Number(result.meta?.changes || result.changes || 0);
       if (!changed) return apiError("storage not found", 404);
+      const row = await db.prepare("SELECT * FROM storages WHERE id = ?").bind(id).first();
+      if (row) refreshedStorages = [storageFromRow(row)];
     } else {
       const result = await db.prepare("UPDATE storages SET modified = CURRENT_TIMESTAMP").run();
       changed = Number(result.meta?.changes || result.changes || 0);
+      const rows = await db.prepare("SELECT * FROM storages WHERE disabled = 0 ORDER BY storage_order, mount_path").all();
+      refreshedStorages = rows.results.map(storageFromRow);
     }
     await clearStorageVersionCache(env);
-    return ok({ refreshed: changed, id: id || null });
+    const preheat = scheduleStorageCachePreheat(context, env, refreshedStorages);
+    return ok({ refreshed: changed, id: id || null, preheat });
   }
   if (path.endsWith("/load_all")) return ok();
   return apiError("api not found", 404);
+}
+
+function scheduleStorageCachePreheat(context, env, storages) {
+  const activeStorages = (storages || []).filter((storage) => storage && !storage.disabled);
+  if (activeStorages.length === 0) return "none";
+  if (!context || typeof context.waitUntil !== "function") return "unavailable";
+  context.waitUntil(preheatStorageCaches(env, activeStorages).catch(() => {}));
+  return "scheduled";
+}
+
+async function preheatStorageCaches(env, storages) {
+  await Promise.allSettled(storages.map((storage) => preheatStorageCache(env, storage)));
+}
+
+async function preheatStorageCache(env, storage) {
+  const rootPath = normalizePath(storage.mount_path || "/");
+  const listing = await listPath(env, rootPath, null, { refresh: true });
+  const dirs = sortObjects(listing.content || [], listing.storage || storage)
+    .filter((obj) => obj && obj.is_dir && !obj.virtual);
+  await preheatChildDirectories(env, storage, rootPath, dirs);
 }
 
 async function adminMeta(request, env, path) {
@@ -1185,7 +1213,13 @@ function mergeListContent(items, virtual) {
 }
 
 async function cacheListPathContent(env, storage, reqPath, cacheKey, cacheSeconds, tag, content) {
-  await setRuntimeCache(cacheKey, { tag, content }, LONG_CACHE_SECONDS);
+  const cachedAt = nowSeconds();
+  await setRuntimeCache(cacheKey, {
+    tag,
+    content,
+    cached_at: cachedAt,
+    fresh_until: cachedAt + cacheSeconds,
+  }, LONG_CACHE_SECONDS);
   if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
 }
 
@@ -1909,58 +1943,136 @@ function storageCacheRefreshScript() {
 (function(){
   if (window.__openlistStorageCacheRefresh) return;
   window.__openlistStorageCacheRefresh = true;
-  var button = null;
+  var panel = null;
+  var select = null;
+  var status = null;
+  var refreshButton = null;
+  var refreshAllButton = null;
+  var loaded = false;
+  var loading = false;
   function inStoragePage() {
     return /\\/(?:@|%40)manage\\/storages(?:\\/|$)/.test(location.pathname) || location.hash.indexOf("@manage/storages") >= 0;
   }
   function authToken() {
     return localStorage.getItem("token") || localStorage.getItem("openlist_token") || localStorage.getItem("alist_token") || "";
   }
-  function ensureButton() {
-    if (!inStoragePage()) {
-      if (button) button.hidden = true;
+  function setStatus(message) {
+    if (status) status.textContent = message || "";
+  }
+  function setBusy(busy) {
+    if (refreshButton) refreshButton.disabled = busy;
+    if (refreshAllButton) refreshAllButton.disabled = busy;
+    if (select) select.disabled = busy;
+  }
+  function authHeaders() {
+    var token = authToken();
+    if (!token) throw new Error("Please login first.");
+    return { "Content-Type": "application/json", Authorization: token };
+  }
+  async function adminApi(path, body) {
+    var resp = await fetch(path, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body || {})
+    });
+    var data = await resp.json().catch(function(){ return {}; });
+    if (!resp.ok || data.code !== 200) throw new Error(data.message || "Request failed");
+    return data.data || {};
+  }
+  function createPanel() {
+    if (panel) return;
+    panel = document.createElement("div");
+    panel.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:2147483647;width:min(320px,calc(100vw - 36px));border:1px solid rgba(148,163,184,.42);border-radius:8px;padding:12px;background:rgba(15,23,42,.94);color:#fff;font:14px system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 12px 30px rgba(15,23,42,.28)";
+    var title = document.createElement("div");
+    title.textContent = "OneDrive cache";
+    title.style.cssText = "font-weight:700;margin-bottom:8px";
+    select = document.createElement("select");
+    select.style.cssText = "box-sizing:border-box;width:100%;height:34px;border:1px solid rgba(203,213,225,.72);border-radius:6px;background:#fff;color:#111827;margin-bottom:8px";
+    var row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px";
+    refreshButton = document.createElement("button");
+    refreshButton.type = "button";
+    refreshButton.textContent = "Refresh selected";
+    refreshButton.style.cssText = "flex:1;border:0;border-radius:6px;padding:8px 10px;background:#2563eb;color:#fff;font-weight:650;cursor:pointer";
+    refreshAllButton = document.createElement("button");
+    refreshAllButton.type = "button";
+    refreshAllButton.textContent = "Refresh all";
+    refreshAllButton.style.cssText = "border:0;border-radius:6px;padding:8px 10px;background:#475569;color:#fff;font-weight:650;cursor:pointer";
+    status = document.createElement("div");
+    status.style.cssText = "min-height:18px;margin-top:8px;color:#cbd5e1;font-size:12px;line-height:1.4";
+    refreshButton.onclick = function() {
+      var id = select && select.value ? Number(select.value) : 0;
+      refreshCache(id);
+    };
+    refreshAllButton.onclick = function() {
+      if (confirm("Refresh all OneDrive storage caches now?")) refreshCache(0);
+    };
+    row.appendChild(refreshButton);
+    row.appendChild(refreshAllButton);
+    panel.appendChild(title);
+    panel.appendChild(select);
+    panel.appendChild(row);
+    panel.appendChild(status);
+    document.body.appendChild(panel);
+  }
+  async function loadStorages(force) {
+    if (!panel || loading || (loaded && !force)) return;
+    if (!authToken()) {
+      if (select) select.innerHTML = '<option value="">Login required</option>';
+      setStatus("Login as admin to refresh storage cache.");
       return;
     }
-    if (!button) {
-      button = document.createElement("button");
-      button.type = "button";
-      button.textContent = "Refresh cache";
-      button.title = "Force refresh OneDrive cache";
-      button.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:2147483647;border:0;border-radius:8px;padding:10px 14px;background:#2563eb;color:#fff;font:600 14px system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 8px 24px rgba(15,23,42,.22);cursor:pointer";
-      button.onclick = async function() {
-        if (!confirm("Refresh all OneDrive cache now?")) return;
-        var token = authToken();
-        if (!token) {
-          alert("Please login first.");
-          return;
+    loading = true;
+    setStatus("Loading storages...");
+    try {
+      var previous = select ? select.value : "";
+      var data = await adminApi("/api/admin/storage/list", { page: 1, per_page: 100 });
+      var storages = Array.isArray(data.content) ? data.content : [];
+      if (select) {
+        select.innerHTML = storages.map(function(storage) {
+          var disabled = storage.disabled ? " disabled" : "";
+          return '<option value="' + String(storage.id) + '"' + disabled + '>' + String(storage.mount_path || "/") + '</option>';
+        }).join("") || '<option value="">No storages</option>';
+        if (previous && Array.prototype.some.call(select.options, function(option) { return option.value === previous; })) {
+          select.value = previous;
         }
-        button.disabled = true;
-        button.textContent = "Refreshing...";
-        try {
-          var resp = await fetch("/api/admin/storage/refresh_cache", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: token },
-            body: "{}"
-          });
-          var data = await resp.json().catch(function(){ return {}; });
-          if (!resp.ok || data.code !== 200) throw new Error(data.message || "Refresh failed");
-          button.textContent = "Cache refreshed";
-          setTimeout(function(){ button.textContent = "Refresh cache"; button.disabled = false; }, 1500);
-        } catch (error) {
-          alert(error && error.message ? error.message : "Refresh failed");
-          button.textContent = "Refresh cache";
-          button.disabled = false;
-        }
-      };
-      document.body.appendChild(button);
+      }
+      loaded = true;
+      setStatus(storages.length ? "Ready." : "No storage found.");
+    } catch (error) {
+      setStatus(error && error.message ? error.message : "Failed to load storages.");
+    } finally {
+      loading = false;
     }
-    button.hidden = false;
   }
-  window.addEventListener("popstate", ensureButton);
-  window.addEventListener("hashchange", ensureButton);
-  new MutationObserver(ensureButton).observe(document.documentElement, { childList: true, subtree: true });
-  setInterval(ensureButton, 1000);
-  ensureButton();
+  async function refreshCache(id) {
+    setBusy(true);
+    setStatus("Refreshing cache...");
+    try {
+      var result = await adminApi("/api/admin/storage/refresh_cache", id ? { id: id } : {});
+      loaded = false;
+      setStatus("Refreshed " + (result.refreshed || 0) + " storage(s); preheat " + (result.preheat || "none") + ".");
+      loadStorages(true);
+    } catch (error) {
+      setStatus(error && error.message ? error.message : "Refresh failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  function ensurePanel() {
+    if (!inStoragePage()) {
+      if (panel) panel.hidden = true;
+      return;
+    }
+    createPanel();
+    panel.hidden = false;
+    loadStorages(false);
+  }
+  window.addEventListener("popstate", ensurePanel);
+  window.addEventListener("hashchange", ensurePanel);
+  new MutationObserver(ensurePanel).observe(document.documentElement, { childList: true, subtree: true });
+  setInterval(ensurePanel, 1000);
+  ensurePanel();
 })();
 </script>`;
 }
@@ -2472,6 +2584,8 @@ function fsListTag(payload) {
 }
 
 async function isOneDriveListCacheTrusted(env, storage, reqPath, payload) {
+  const freshUntil = payload && !Array.isArray(payload) ? Number(payload.fresh_until || 0) : 0;
+  if (freshUntil > nowSeconds()) return true;
   const tag = payload && !Array.isArray(payload) ? String(payload.tag || "") : "";
   if (!tag) return false;
   const freshKey = fsListFreshKey(storage, reqPath);
@@ -2485,11 +2599,27 @@ function downloadCacheKey(storage, reqPath) {
 }
 
 async function getRuntimeCache(key) {
-  const memKey = `runtime:${key}`;
+  const memKey = runtimeMemoryKey(key);
   const cached = memoryGet(memKey);
   if (cached !== undefined) return cached;
+  if (isFsRuntimeCacheKey(key)) {
+    const legacyCached = memoryGet(`runtime:${key}`);
+    if (legacyCached !== undefined) {
+      memorySet(memKey, legacyCached, RUNTIME_MEMORY_TTL);
+      return legacyCached;
+    }
+  }
+  const current = await getRuntimeCacheFromNamespace(key, runtimeCacheNamespaceForKey(key), memKey);
+  if (current !== null) return current;
+  if (isFsRuntimeCacheKey(key) && runtimeCacheNamespace !== fsRuntimeCacheNamespace) {
+    return getRuntimeCacheFromNamespace(key, runtimeCacheNamespace, memKey);
+  }
+  return null;
+}
+
+async function getRuntimeCacheFromNamespace(key, namespace, memKey) {
   if (typeof caches === "undefined" || !caches.default) return null;
-  const request = await runtimeCacheRequest(key);
+  const request = await runtimeCacheRequest(key, namespace);
   const resp = await caches.default.match(request).catch(() => null);
   if (!resp || !resp.ok) return null;
   const data = await resp.json().catch(() => null);
@@ -2500,7 +2630,7 @@ async function getRuntimeCache(key) {
 
 async function setRuntimeCache(key, value, seconds) {
   if (seconds <= 0) return;
-  memorySet(`runtime:${key}`, value, Math.min(seconds, RUNTIME_MEMORY_TTL));
+  memorySet(runtimeMemoryKey(key), value, Math.min(seconds, RUNTIME_MEMORY_TTL));
   if (typeof caches === "undefined" || !caches.default) return;
   const request = await runtimeCacheRequest(key);
   const body = JSON.stringify({ value, expires_at: nowSeconds() + seconds });
@@ -2514,14 +2644,27 @@ async function setRuntimeCache(key, value, seconds) {
 }
 
 async function deleteRuntimeCache(key) {
-  memoryDelete(`runtime:${key}`);
+  memoryDelete(runtimeMemoryKey(key));
   if (typeof caches === "undefined" || !caches.default) return;
   const request = await runtimeCacheRequest(key);
   await caches.default.delete(request).catch(() => {});
 }
 
-async function runtimeCacheRequest(key) {
-  return new Request(`https://openlist-runtime-cache.local/${await sha256Hex(`${runtimeCacheNamespace}:${key}`)}`, { method: "GET" });
+async function runtimeCacheRequest(key, namespace = runtimeCacheNamespaceForKey(key)) {
+  return new Request(`https://openlist-runtime-cache.local/${await sha256Hex(`${namespace}:${key}`)}`, { method: "GET" });
+}
+
+function runtimeMemoryKey(key) {
+  if (isFsRuntimeCacheKey(key)) return `runtime:${fsRuntimeCacheNamespace}:${key}`;
+  return `runtime:${key}`;
+}
+
+function runtimeCacheNamespaceForKey(key) {
+  return isFsRuntimeCacheKey(key) ? fsRuntimeCacheNamespace : runtimeCacheNamespace;
+}
+
+function isFsRuntimeCacheKey(key) {
+  return String(key || "").startsWith("fs:list:") || String(key || "").startsWith("fs:fresh:");
 }
 
 function runtimeCacheNamespaceFromEnv(env) {
@@ -2531,6 +2674,10 @@ function runtimeCacheNamespaceFromEnv(env) {
     env.CF_PAGES_DEPLOYMENT_ID ||
     "default"
   );
+}
+
+function fsRuntimeCacheNamespaceFromEnv(env) {
+  return String(env.OPENLIST_FS_CACHE_VERSION || env.OPENLIST_CACHE_VERSION || "openlist-fs-v1");
 }
 
 async function pathSign(env, path, ts) {
@@ -2768,6 +2915,7 @@ async function clearStorageVersionCache(env) {
   clearMemoryPrefix("runtime:storages:");
   clearMemoryPrefix("runtime:download:");
   clearMemoryPrefix("runtime:fs:");
+  clearMemoryPrefix(`runtime:${fsRuntimeCacheNamespace}:fs:`);
   await deleteRuntimeCache("storages:all");
 }
 
