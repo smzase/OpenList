@@ -14,6 +14,7 @@ const MEM_CACHE = new Map();
 const INFLIGHT_LISTS = new Map();
 const VOLATILE_SETTING_KEYS = new Set(["index_progress", "scan_progress"]);
 const SETTINGS_MEMORY_TTL = 60;
+const GUEST_API_CACHE_SECONDS = 60;
 const PUBLIC_CONFIG_TTL = 300;
 const RUNTIME_MEMORY_TTL = 300;
 const SESSION_CACHE_SECONDS = 60;
@@ -417,6 +418,10 @@ window.openlistTurnstileCallback = async function(token) {
     });
     var data = await resp.json().catch(function(){ return {}; });
     if (!resp.ok || data.code !== 200) throw new Error(data.message || "Verification failed");
+    try {
+      var expiresAt = data && data.data ? data.data.expires_at : 0;
+      if (expiresAt) localStorage.setItem("openlist_turnstile_verified_until", String(expiresAt));
+    } catch (error) {}
     openlistTurnstileStatus("Verified. Continuing...");
     location.replace(openlistTurnstileReturnTo || "/");
   } catch (error) {
@@ -559,9 +564,15 @@ async function logout(request, env) {
 }
 
 async function currentUser(request, env) {
+  const token = bearerToken(request);
   const user = await getRequestUser(request, env, false);
   if (!user) return apiError("Guest user is disabled, login please", 401);
-  return ok(safeUser(user));
+  return ok(
+    safeUser(user),
+    token
+      ? { "Cache-Control": "no-store", Vary: "Authorization" }
+      : shortPublicCacheHeaders({ Vary: "Authorization" }),
+  );
 }
 
 async function getRequestUser(request, env, allowDisabledGuest) {
@@ -1987,7 +1998,7 @@ function isDynamicAssetRoute(path) {
 async function publicSettings(env) {
   const startedAt = nowMilliseconds();
   const trace = { cache: "unknown" };
-  return ok(await publicSettingsMap(env, trace), publicApiDebugHeaders(trace.cache, startedAt));
+  return ok(await publicSettingsMap(env, trace), publicApiDebugHeaders(trace.cache, startedAt, shortPublicCacheHeaders()));
 }
 
 async function publicSettingsMap(env, trace = null) {
@@ -2677,6 +2688,13 @@ function publicApiDebugHeaders(cacheState, startedAt, headers = {}) {
     ...headers,
     "X-OpenList-Cache": cacheState || "unknown",
   });
+}
+
+function shortPublicCacheHeaders(headers = {}) {
+  return {
+    "Cache-Control": `public, max-age=${GUEST_API_CACHE_SECONDS}`,
+    ...headers,
+  };
 }
 
 function debugHeaders(startedAt, headers = {}) {

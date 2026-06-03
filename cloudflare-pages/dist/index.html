@@ -2,6 +2,120 @@
 <html lang="en" translate="no">
   <head>
     <!-- customize head -->
+    <script id="openlist-pages-turnstile">
+      (function () {
+        if (window.__openlistPagesTurnstile) return;
+        window.__openlistPagesTurnstile = true;
+        var statusPath = "/api/turnstile/status";
+        var challengePath = "/api/turnstile/challenge";
+        var verifyPath = "/api/turnstile/verify";
+        var renewHintKey = "openlist_turnstile_verified_until";
+        var lastRenew = 0;
+        function returnTo() {
+          return location.pathname + location.search + location.hash;
+        }
+        function challenge() {
+          try { document.documentElement.style.visibility = "hidden"; } catch (error) {}
+          location.replace(challengePath + "?return_to=" + encodeURIComponent(returnTo()));
+        }
+        function pathOf(input) {
+          try {
+            var raw = typeof input === "string" ? input : input && input.url;
+            return raw ? new URL(raw, location.href).pathname : "";
+          } catch (error) {
+            return "";
+          }
+        }
+        function payloadNeedsChallenge(payload) {
+          var data = payload && payload.data ? payload.data : {};
+          return !!(data.challenge_url || data.verify_url || payload && payload.message === "Turnstile verification required");
+        }
+        function inspectPayload(payload) {
+          if (payloadNeedsChallenge(payload)) challenge();
+        }
+        function verifiedUntil() {
+          try {
+            return Number(localStorage.getItem(renewHintKey) || 0);
+          } catch (error) {
+            return 0;
+          }
+        }
+        function needsRenewal(now) {
+          var until = verifiedUntil();
+          return until > 0 && until - Math.floor(now / 1000) < 5 * 60;
+        }
+        function rememberVerified(payload) {
+          var data = payload && payload.data ? payload.data : {};
+          if (!data.verified) return;
+          try {
+            localStorage.setItem(renewHintKey, String(data.expires_at || Math.floor(Date.now() / 1000) + 30 * 60));
+          } catch (error) {}
+        }
+        function inspectResponse(res, input) {
+          if (!res || res.status !== 403) return;
+          var path = pathOf(input || res.url);
+          if (path === statusPath || path === challengePath || path === verifyPath) return;
+          if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
+          res.clone().json().then(inspectPayload).catch(function () {});
+        }
+        function checkStatus() {
+          lastRenew = Date.now();
+          fetch(statusPath, { credentials: "same-origin", cache: "no-store" })
+            .then(function (res) { return res && res.ok ? res.json() : null; })
+            .then(function (payload) {
+              var data = payload && payload.data ? payload.data : {};
+              rememberVerified(payload);
+              if (data.enabled && !data.verified) challenge();
+            })
+            .catch(function () {});
+        }
+        function renewSoon() {
+          var now = Date.now();
+          if (now - lastRenew < 60 * 1000) return;
+          if (!needsRenewal(now)) return;
+          checkStatus();
+        }
+        var nativeFetch = window.fetch;
+        if (nativeFetch) {
+          window.fetch = function (input, init) {
+            var promise = nativeFetch.apply(this, arguments);
+            promise.then(function (res) { inspectResponse(res, input); }).catch(function () {});
+            return promise;
+          };
+        }
+        var nativeOpen = XMLHttpRequest.prototype.open;
+        var nativeSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          this.__openlistTurnstileUrl = url;
+          return nativeOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function () {
+          this.addEventListener("load", function () {
+            if (this.status !== 403) return;
+            var path = pathOf(this.__openlistTurnstileUrl || "");
+            if (path === statusPath || path === challengePath || path === verifyPath) return;
+            if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
+            try { inspectPayload(JSON.parse(this.responseText || "{}")); } catch (error) {}
+          });
+          return nativeSend.apply(this, arguments);
+        };
+        if (window.setInterval) {
+          window.setInterval(renewSoon, 60 * 1000);
+        }
+        document.addEventListener("play", renewSoon, true);
+        document.addEventListener("playing", renewSoon, true);
+        document.addEventListener("timeupdate", renewSoon, true);
+        document.addEventListener("seeking", renewSoon, true);
+        document.addEventListener("waiting", renewSoon, true);
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", function () {
+            Array.prototype.forEach.call(document.querySelectorAll("audio,video"), function (media) {
+              if (!media.paused && !media.ended) renewSoon();
+            });
+          }, { once: true });
+        }
+      })();
+    </script>
     <style id="openlist-pages-loading-image-style">
       .openlist-loading-image {
         width: 100px !important;
@@ -48,116 +162,7 @@
         window.addEventListener("resize", scheduleScan);
       })();
     </script>
-    <script id="openlist-pages-turnstile">
-      (function () {
-        if (window.__openlistPagesTurnstile) return;
-        window.__openlistPagesTurnstile = true;
-        var statusPath = "/api/turnstile/status";
-        var challengePath = "/api/turnstile/challenge";
-        var verifyPath = "/api/turnstile/verify";
-        var lastRenew = 0;
-        function returnTo() {
-          return location.pathname + location.search + location.hash;
-        }
-        function challenge() {
-          try { document.documentElement.style.visibility = "hidden"; } catch (error) {}
-          location.replace(challengePath + "?return_to=" + encodeURIComponent(returnTo()));
-        }
-        function pathOf(input) {
-          try {
-            var raw = typeof input === "string" ? input : input && input.url;
-            return raw ? new URL(raw, location.href).pathname : "";
-          } catch (error) {
-            return "";
-          }
-        }
-        function payloadNeedsChallenge(payload) {
-          var data = payload && payload.data ? payload.data : {};
-          return !!(data.challenge_url || data.verify_url || payload && payload.message === "Turnstile verification required");
-        }
-        function inspectPayload(payload) {
-          if (payloadNeedsChallenge(payload)) challenge();
-        }
-        function inspectResponse(res, input) {
-          if (!res || res.status !== 403) return;
-          var path = pathOf(input || res.url);
-          if (path === statusPath || path === challengePath || path === verifyPath) return;
-          if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
-          res.clone().json().then(inspectPayload).catch(function () {});
-        }
-        function checkStatus(sync) {
-          lastRenew = Date.now();
-          if (sync) {
-            try {
-              var xhr = new XMLHttpRequest();
-              xhr.open("GET", statusPath, false);
-              xhr.withCredentials = true;
-              xhr.send(null);
-              if (xhr.status >= 200 && xhr.status < 300) {
-                var payload = JSON.parse(xhr.responseText || "{}");
-                var data = payload && payload.data ? payload.data : {};
-                if (data.enabled && !data.verified) challenge();
-              }
-            } catch (error) {}
-            return;
-          }
-          fetch(statusPath, { credentials: "same-origin", cache: "no-store" })
-            .then(function (res) { return res && res.ok ? res.json() : null; })
-            .then(function (payload) {
-              var data = payload && payload.data ? payload.data : {};
-              if (data.enabled && !data.verified) challenge();
-            })
-            .catch(function () {});
-        }
-        function renewSoon() {
-          var now = Date.now();
-          if (now - lastRenew < 60 * 1000) return;
-          checkStatus(false);
-        }
-        var nativeFetch = window.fetch;
-        if (nativeFetch) {
-          window.fetch = function (input, init) {
-            var promise = nativeFetch.apply(this, arguments);
-            promise.then(function (res) { inspectResponse(res, input); }).catch(function () {});
-            return promise;
-          };
-        }
-        var nativeOpen = XMLHttpRequest.prototype.open;
-        var nativeSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (method, url) {
-          this.__openlistTurnstileUrl = url;
-          return nativeOpen.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function () {
-          this.addEventListener("load", function () {
-            if (this.status !== 403) return;
-            var path = pathOf(this.__openlistTurnstileUrl || "");
-            if (path === statusPath || path === challengePath || path === verifyPath) return;
-            if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
-            try { inspectPayload(JSON.parse(this.responseText || "{}")); } catch (error) {}
-          });
-          return nativeSend.apply(this, arguments);
-        };
-        checkStatus(true);
-        if (window.setInterval) {
-          window.setInterval(function () { checkStatus(false); }, 12 * 60 * 1000);
-        }
-        document.addEventListener("play", renewSoon, true);
-        document.addEventListener("playing", renewSoon, true);
-        document.addEventListener("timeupdate", renewSoon, true);
-        document.addEventListener("seeking", renewSoon, true);
-        document.addEventListener("waiting", renewSoon, true);
-        if (document.readyState === "loading") {
-          document.addEventListener("DOMContentLoaded", function () {
-            Array.prototype.forEach.call(document.querySelectorAll("audio,video"), function (media) {
-              if (!media.paused && !media.ended) renewSoon();
-            });
-          }, { once: true });
-        }
-      })();
-    </script>
     <!-- openlist pages preloads -->
-    <link rel="preload" as="fetch" crossorigin href="/api/public/settings">
     <link rel="modulepreload" crossorigin href="/assets/index-qF4sv01e.js" >
     <link rel="preload" as="style" crossorigin href="/assets/index-Bpb1jTBr.css" >
     <link rel="modulepreload" crossorigin href="/assets/Layout-A5t8lWBA.js" >

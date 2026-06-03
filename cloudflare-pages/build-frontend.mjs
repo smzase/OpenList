@@ -9,7 +9,6 @@ const distDir = resolve(root, "dist");
 const tmpTar = resolve(root, "openlist-frontend-dist.tar.gz");
 const preloadStart = "<!-- openlist pages preloads -->";
 const preloadEnd = "<!-- /openlist pages preloads -->";
-const settingsPreload = `<link rel="preload" as="fetch" crossorigin href="/api/public/settings">`;
 const langPreloadStart = "<!-- openlist pages language preload -->";
 const langPreloadEnd = "<!-- /openlist pages language preload -->";
 const loadingImageBootstrap = `<style id="openlist-pages-loading-image-style">
@@ -65,6 +64,7 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
     var statusPath = "/api/turnstile/status";
     var challengePath = "/api/turnstile/challenge";
     var verifyPath = "/api/turnstile/verify";
+    var renewHintKey = "openlist_turnstile_verified_until";
     var lastRenew = 0;
     function returnTo() {
       return location.pathname + location.search + location.hash;
@@ -88,6 +88,24 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
     function inspectPayload(payload) {
       if (payloadNeedsChallenge(payload)) challenge();
     }
+    function verifiedUntil() {
+      try {
+        return Number(localStorage.getItem(renewHintKey) || 0);
+      } catch (error) {
+        return 0;
+      }
+    }
+    function needsRenewal(now) {
+      var until = verifiedUntil();
+      return until > 0 && until - Math.floor(now / 1000) < 5 * 60;
+    }
+    function rememberVerified(payload) {
+      var data = payload && payload.data ? payload.data : {};
+      if (!data.verified) return;
+      try {
+        localStorage.setItem(renewHintKey, String(data.expires_at || Math.floor(Date.now() / 1000) + 30 * 60));
+      } catch (error) {}
+    }
     function inspectResponse(res, input) {
       if (!res || res.status !== 403) return;
       var path = pathOf(input || res.url);
@@ -95,26 +113,13 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
       if (!path.startsWith("/api/") && !path.startsWith("/d/")) return;
       res.clone().json().then(inspectPayload).catch(function () {});
     }
-    function checkStatus(sync) {
+    function checkStatus() {
       lastRenew = Date.now();
-      if (sync) {
-        try {
-          var xhr = new XMLHttpRequest();
-          xhr.open("GET", statusPath, false);
-          xhr.withCredentials = true;
-          xhr.send(null);
-          if (xhr.status >= 200 && xhr.status < 300) {
-            var payload = JSON.parse(xhr.responseText || "{}");
-            var data = payload && payload.data ? payload.data : {};
-            if (data.enabled && !data.verified) challenge();
-          }
-        } catch (error) {}
-        return;
-      }
       fetch(statusPath, { credentials: "same-origin", cache: "no-store" })
         .then(function (res) { return res && res.ok ? res.json() : null; })
         .then(function (payload) {
           var data = payload && payload.data ? payload.data : {};
+          rememberVerified(payload);
           if (data.enabled && !data.verified) challenge();
         })
         .catch(function () {});
@@ -122,7 +127,8 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
     function renewSoon() {
       var now = Date.now();
       if (now - lastRenew < 60 * 1000) return;
-      checkStatus(false);
+      if (!needsRenewal(now)) return;
+      checkStatus();
     }
     var nativeFetch = window.fetch;
     if (nativeFetch) {
@@ -148,9 +154,8 @@ const turnstileBootstrap = `<script id="openlist-pages-turnstile">
       });
       return nativeSend.apply(this, arguments);
     };
-    checkStatus(true);
     if (window.setInterval) {
-      window.setInterval(function () { checkStatus(false); }, 12 * 60 * 1000);
+      window.setInterval(renewSoon, 60 * 1000);
     }
     document.addEventListener("play", renewSoon, true);
     document.addEventListener("playing", renewSoon, true);
@@ -447,12 +452,11 @@ async function injectLanguagePreloadScript(html) {
 
 async function injectPreloadLinks(html) {
   html = html.replace(new RegExp(`\\s*${escapeRegExp(preloadStart)}[\\s\\S]*?${escapeRegExp(preloadEnd)}\\s*`, "i"), "\n");
-  html = html.replace(new RegExp(`\\s*${escapeRegExp(settingsPreload)}\\s*`, "i"), "\n");
+  html = html.replace(/\s*<link\b(?=[^>]*rel=["']preload["'])(?=[^>]*href=["']\/api\/public\/settings["'])[^>]*>\s*/i, "\n");
   const preloads = await collectPreloadLinks(html);
-  if (preloads.length === 0) return injectSettingsPreload(html);
+  if (preloads.length === 0) return html;
   const block = [
     preloadStart,
-    `    ${settingsPreload}`,
     ...preloads.map((href) => {
       if (href.endsWith(".css")) return `    <link rel="preload" as="style" crossorigin href="${href}" >`;
       return `    <link rel="modulepreload" crossorigin href="${href}" >`;
@@ -462,13 +466,6 @@ async function injectPreloadLinks(html) {
   const marker = "<!-- customize head -->";
   if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
   return html.replace("</head>", `    ${block}\n  </head>`);
-}
-
-function injectSettingsPreload(html) {
-  if (html.includes(settingsPreload)) return html;
-  const marker = "<!-- customize head -->";
-  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${settingsPreload}`);
-  return html.replace("</head>", `    ${settingsPreload}\n  </head>`);
 }
 
 async function collectPreloadLinks(html) {
