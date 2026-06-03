@@ -11,6 +11,270 @@ const preloadStart = "<!-- openlist pages preloads -->";
 const preloadEnd = "<!-- /openlist pages preloads -->";
 const langPreloadStart = "<!-- openlist pages language preload -->";
 const langPreloadEnd = "<!-- /openlist pages language preload -->";
+const fsListCacheBootstrap = `<script id="openlist-pages-fs-list-cache">
+  (function () {
+    if (window.__openlistPagesFsListCache) return;
+    window.__openlistPagesFsListCache = true;
+    var ttl = 60 * 1000;
+    var maxEntries = 64;
+    var cache = new Map();
+    function tokenPresent() {
+      try {
+        return !!(localStorage.getItem("token") || localStorage.getItem("openlist_token") || localStorage.getItem("alist_token"));
+      } catch (error) {
+        return false;
+      }
+    }
+    function headerValue(headers, name) {
+      if (!headers) return "";
+      var lower = name.toLowerCase();
+      if (typeof Headers !== "undefined" && headers instanceof Headers) return headers.get(name) || "";
+      if (Array.isArray(headers)) {
+        for (var i = 0; i < headers.length; i++) {
+          if (String(headers[i][0] || "").toLowerCase() === lower) return String(headers[i][1] || "");
+        }
+        return "";
+      }
+      for (var key in headers) {
+        if (String(key).toLowerCase() === lower) return String(headers[key] || "");
+      }
+      return "";
+    }
+    function hasAuthHeader(input, init, extraHeaders) {
+      return !!(
+        tokenPresent() ||
+        headerValue(extraHeaders, "authorization") ||
+        headerValue(init && init.headers, "authorization") ||
+        headerValue(input && input.headers, "authorization")
+      );
+    }
+    function pathOf(input) {
+      try {
+        var raw = typeof input === "string" ? input : input && input.url;
+        if (!raw) return "";
+        var url = new URL(raw, location.href);
+        if (url.origin !== location.origin) return "";
+        return url.pathname;
+      } catch (error) {
+        return "";
+      }
+    }
+    function truthy(value) {
+      return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+    }
+    function cacheKeyFromBody(body) {
+      if (typeof body !== "string") return "";
+      var payload;
+      try {
+        payload = JSON.parse(body || "{}");
+      } catch (error) {
+        return "";
+      }
+      if (!payload || typeof payload !== "object") return "";
+      if (truthy(payload.refresh)) return "";
+      if (String(payload.password || "")) return "";
+      return JSON.stringify({
+        path: String(payload.path || "/"),
+        page: Number(payload.page || 1) || 1,
+        per_page: Number(payload.per_page || 0) || 0
+      });
+    }
+    function getCached(key) {
+      var hit = cache.get(key);
+      if (!hit) return null;
+      if (hit.expires <= Date.now()) {
+        cache.delete(key);
+        return null;
+      }
+      return hit;
+    }
+    function setCached(key, text) {
+      try {
+        var payload = JSON.parse(text || "{}");
+        if (!payload || payload.code !== 200) return;
+      } catch (error) {
+        return;
+      }
+      if (cache.size >= maxEntries) cache.delete(cache.keys().next().value);
+      cache.set(key, { text: text, expires: Date.now() + ttl });
+    }
+    function cachedHeaders() {
+      return "content-type: application/json; charset=utf-8\\r\\ncache-control: private, max-age=60\\r\\nx-openlist-client-cache: hit\\r\\n";
+    }
+    function cachedHeader(name) {
+      name = String(name || "").toLowerCase();
+      if (name === "content-type") return "application/json; charset=utf-8";
+      if (name === "cache-control") return "private, max-age=60";
+      if (name === "x-openlist-client-cache") return "hit";
+      return null;
+    }
+    var nativeFetch = window.fetch;
+    if (nativeFetch) {
+      window.fetch = function (input, init) {
+        var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+        var key = "";
+        if (method === "POST" && pathOf(input) === "/api/fs/list" && !hasAuthHeader(input, init)) {
+          key = cacheKeyFromBody(init && init.body);
+          var hit = key && getCached(key);
+          if (hit && typeof Response !== "undefined") {
+            return Promise.resolve(new Response(hit.text, {
+              status: 200,
+              headers: { "Content-Type": "application/json; charset=utf-8", "X-OpenList-Client-Cache": "hit" }
+            }));
+          }
+        }
+        var promise = nativeFetch.apply(this, arguments);
+        if (key) {
+          promise.then(function (res) {
+            if (res && res.ok) res.clone().text().then(function (text) { setCached(key, text); }).catch(function () {});
+          }).catch(function () {});
+        }
+        return promise;
+      };
+    }
+    var NativeXHR = window.XMLHttpRequest;
+    if (!NativeXHR || !NativeXHR.prototype) return;
+    function CachedXHR() {
+      this.__xhr = new NativeXHR();
+      this.__method = "GET";
+      this.__url = "";
+      this.__headers = {};
+      this.__listeners = {};
+      this.__listenerWrappers = {};
+      this.__handlers = {};
+      this.__cached = null;
+      this.__responseType = "";
+      this.upload = this.__xhr.upload;
+    }
+    function defineHandler(name) {
+      Object.defineProperty(CachedXHR.prototype, name, {
+        get: function () { return this.__handlers[name] || null; },
+        set: function (handler) {
+          var self = this;
+          this.__handlers[name] = handler;
+          this.__xhr[name] = typeof handler === "function" ? function (event) { return handler.call(self, event); } : handler;
+        }
+      });
+    }
+    function dispatchCached(xhr, type) {
+      var event;
+      try {
+        event = new Event(type);
+        Object.defineProperty(event, "target", { value: xhr });
+        Object.defineProperty(event, "currentTarget", { value: xhr });
+      } catch (error) {
+        event = { type: type, target: xhr, currentTarget: xhr };
+      }
+      var handler = xhr.__handlers["on" + type];
+      if (typeof handler === "function") handler.call(xhr, event);
+      var listeners = xhr.__listeners[type] || [];
+      for (var i = 0; i < listeners.length; i++) {
+        if (typeof listeners[i] === "function") listeners[i].call(xhr, event);
+        else if (listeners[i] && typeof listeners[i].handleEvent === "function") listeners[i].handleEvent(event);
+      }
+    }
+    CachedXHR.prototype.open = function (method, url) {
+      this.__method = String(method || "GET").toUpperCase();
+      this.__url = url;
+      return this.__xhr.open.apply(this.__xhr, arguments);
+    };
+    CachedXHR.prototype.setRequestHeader = function (name, value) {
+      this.__headers[String(name || "").toLowerCase()] = String(value || "");
+      return this.__xhr.setRequestHeader.apply(this.__xhr, arguments);
+    };
+    CachedXHR.prototype.send = function (body) {
+      var self = this;
+      var key = "";
+      if (this.__method === "POST" && pathOf(this.__url) === "/api/fs/list" && !hasAuthHeader(null, null, this.__headers)) {
+        key = cacheKeyFromBody(body);
+        var hit = key && getCached(key);
+        if (hit) {
+          this.__cached = {
+            readyState: 4,
+            status: 200,
+            statusText: "OK",
+            responseText: hit.text,
+            responseType: this.__responseType || ""
+          };
+          setTimeout(function () {
+            dispatchCached(self, "readystatechange");
+            dispatchCached(self, "load");
+            dispatchCached(self, "loadend");
+          }, 0);
+          return;
+        }
+      }
+      if (key) {
+        this.__xhr.addEventListener("load", function () {
+          try {
+            if (self.__xhr.status === 200) setCached(key, self.__xhr.responseText);
+          } catch (error) {}
+        });
+      }
+      return this.__xhr.send.apply(this.__xhr, arguments);
+    };
+    CachedXHR.prototype.abort = function () { return this.__xhr.abort.apply(this.__xhr, arguments); };
+    CachedXHR.prototype.getAllResponseHeaders = function () { return this.__cached ? cachedHeaders() : this.__xhr.getAllResponseHeaders(); };
+    CachedXHR.prototype.getResponseHeader = function (name) { return this.__cached ? cachedHeader(name) : this.__xhr.getResponseHeader(name); };
+    CachedXHR.prototype.overrideMimeType = function () { return this.__xhr.overrideMimeType.apply(this.__xhr, arguments); };
+    CachedXHR.prototype.addEventListener = function (type, listener, options) {
+      if (!listener) return;
+      var self = this;
+      (this.__listeners[type] || (this.__listeners[type] = [])).push(listener);
+      var wrapper = function (event) { return typeof listener === "function" ? listener.call(self, event) : listener.handleEvent(event); };
+      (this.__listenerWrappers[type] || (this.__listenerWrappers[type] = new Map())).set(listener, wrapper);
+      return this.__xhr.addEventListener(type, wrapper, options);
+    };
+    CachedXHR.prototype.removeEventListener = function (type, listener, options) {
+      var list = this.__listeners[type] || [];
+      var index = list.indexOf(listener);
+      if (index >= 0) list.splice(index, 1);
+      var wrappers = this.__listenerWrappers[type];
+      var wrapper = wrappers && wrappers.get(listener);
+      if (wrapper) wrappers.delete(listener);
+      return this.__xhr.removeEventListener(type, wrapper || listener, options);
+    };
+    CachedXHR.prototype.dispatchEvent = function (event) { return this.__xhr.dispatchEvent(event); };
+    Object.defineProperties(CachedXHR.prototype, {
+      readyState: { get: function () { return this.__cached ? this.__cached.readyState : this.__xhr.readyState; } },
+      status: { get: function () { return this.__cached ? this.__cached.status : this.__xhr.status; } },
+      statusText: { get: function () { return this.__cached ? this.__cached.statusText : this.__xhr.statusText; } },
+      responseURL: { get: function () { return this.__cached ? new URL(this.__url, location.href).href : this.__xhr.responseURL; } },
+      responseText: { get: function () { return this.__cached ? this.__cached.responseText : this.__xhr.responseText; } },
+      responseXML: { get: function () { return this.__cached ? null : this.__xhr.responseXML; } },
+      response: {
+        get: function () {
+          if (!this.__cached) return this.__xhr.response;
+          if (this.__cached.responseType === "json") {
+            try { return JSON.parse(this.__cached.responseText); } catch (error) { return null; }
+          }
+          return this.__cached.responseText;
+        }
+      },
+      responseType: {
+        get: function () { return this.__cached ? this.__cached.responseType : this.__xhr.responseType; },
+        set: function (value) {
+          this.__responseType = value;
+          try { this.__xhr.responseType = value; } catch (error) {}
+        }
+      },
+      timeout: { get: function () { return this.__xhr.timeout; }, set: function (value) { this.__xhr.timeout = value; } },
+      withCredentials: { get: function () { return this.__xhr.withCredentials; }, set: function (value) { this.__xhr.withCredentials = value; } }
+    });
+    defineHandler("onreadystatechange");
+    defineHandler("onload");
+    defineHandler("onloadend");
+    defineHandler("onerror");
+    defineHandler("ontimeout");
+    defineHandler("onabort");
+    CachedXHR.UNSENT = CachedXHR.prototype.UNSENT = 0;
+    CachedXHR.OPENED = CachedXHR.prototype.OPENED = 1;
+    CachedXHR.HEADERS_RECEIVED = CachedXHR.prototype.HEADERS_RECEIVED = 2;
+    CachedXHR.LOADING = CachedXHR.prototype.LOADING = 3;
+    CachedXHR.DONE = CachedXHR.prototype.DONE = 4;
+    window.XMLHttpRequest = CachedXHR;
+  })();
+</script>`;
 const loadingImageBootstrap = `<style id="openlist-pages-loading-image-style">
   .openlist-loading-image {
     width: 100px !important;
@@ -368,6 +632,7 @@ async function patchIndexHtml() {
   html = await injectLanguagePreloadScript(html);
   html = injectLoadingImageBootstrap(html);
   html = injectTurnstileBootstrap(html);
+  html = injectFsListCacheBootstrap(html);
   if (!replacedCustomize) html = injectCustomizeBootstrap(html);
   html = html
     .replace(/\n<meta charset=/i, "\n    <meta charset=")
@@ -387,6 +652,14 @@ function injectLoadingImageBootstrap(html) {
 function injectTurnstileBootstrap(html) {
   html = html.replace(/<script\b[^>]*id=["']openlist-pages-turnstile["'][\s\S]*?<\/script>\s*/i, "");
   const block = turnstileBootstrap.replace(/\n/g, "\n    ");
+  const marker = "<!-- customize head -->";
+  if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
+  return html.replace("</head>", `    ${block}\n  </head>`);
+}
+
+function injectFsListCacheBootstrap(html) {
+  html = html.replace(/<script\b[^>]*id=["']openlist-pages-fs-list-cache["'][\s\S]*?<\/script>\s*/i, "");
+  const block = fsListCacheBootstrap.replace(/\n/g, "\n    ");
   const marker = "<!-- customize head -->";
   if (html.includes(marker)) return html.replace(marker, `${marker}\n    ${block}`);
   return html.replace("</head>", `    ${block}\n  </head>`);
