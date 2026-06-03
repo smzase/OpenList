@@ -1214,12 +1214,13 @@ function mergeListContent(items, virtual) {
 
 async function cacheListPathContent(env, storage, reqPath, cacheKey, cacheSeconds, tag, content) {
   const cachedAt = nowSeconds();
+  const contentCacheSeconds = Math.max(LONG_CACHE_SECONDS, cacheSeconds);
   await setRuntimeCache(cacheKey, {
     tag,
     content,
     cached_at: cachedAt,
     fresh_until: cachedAt + cacheSeconds,
-  }, LONG_CACHE_SECONDS);
+  }, contentCacheSeconds);
   if (tag) await setRuntimeCache(fsListFreshKey(storage, reqPath), tag, cacheSeconds);
 }
 
